@@ -92,7 +92,7 @@ export function TelemetryMonitor({ buffer = telemetryBuffer, className }: Teleme
             media
           </Chip>
           <Chip active={showBaseline} onClick={() => setShowBaseline(!showBaseline)}>
-            r_q
+            sin steering
           </Chip>
         </div>
       </header>
@@ -109,8 +109,8 @@ export function TelemetryMonitor({ buffer = telemetryBuffer, className }: Teleme
         <Legend color="var(--color-ortho)">cabeza proyectada (SKOP)</Legend>
         <Legend color="var(--color-additive)">cabeza aditiva</Legend>
         <Legend color="var(--color-ink-500)">capa sin steering</Legend>
-        <Legend color="var(--color-warn)" dashed>
-          umbral de riesgo τ
+        <Legend color="var(--color-ink-300)" dashed>
+          misma cabeza sin steering
         </Legend>
         <Legend color="#a78bfa" dashed>
           hot-swap

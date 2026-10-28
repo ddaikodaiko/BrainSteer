@@ -93,9 +93,11 @@ export interface CircuitSnapshot {
 export interface HeadTelemetry {
   layer: number
   head: number
-  /** Cociente de Rayleigh de la query actual: energía absoluta (≥ 0), o en [0, 1] si `normalize_rayleigh`. */
+  /** R(q) de la query actual, ya steerada: energía absoluta (≥ 0), o en [0, 1] si `normalize_rayleigh`. */
   rayleigh: number
-  /** Cociente del vector de steering r_q (calibración). */
+  /** R(q − δ): la misma query sin el vector inyectado en su capa. Misma escala que `rayleigh`. */
+  unsteered: number
+  /** R de la dirección de steering de la capa (escala del ranking de riesgo, no de las queries). */
   baseline: number
   risky: boolean
   steered: boolean
@@ -105,9 +107,11 @@ export interface HeadTelemetry {
 export interface TelemetrySummary {
   mean: number
   max: number
+  /** Media de R(q − δ) sobre las mismas cabezas que `mean`. */
+  mean_unsteered: number
   argmax: { layer: number; head: number }
+  /** Umbral del ranking (escala de `baseline`, no comparable con R(q)). */
   risk_threshold: number | null
-  live_over_threshold: number | null
 }
 
 export type Telemetry =

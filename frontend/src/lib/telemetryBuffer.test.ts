@@ -3,10 +3,11 @@ import type { HeadTelemetry, Telemetry } from './protocol'
 import { fmt, niceCeil, windowStart, yMaxFor } from './scopeRenderer'
 import { TelemetryBuffer } from './telemetryBuffer'
 
-const head = (layer: number, h: number, rayleigh: number, risky = true): HeadTelemetry => ({
+const head = (layer: number, h: number, rayleigh: number, risky = true, unsteered = rayleigh): HeadTelemetry => ({
   layer,
   head: h,
   rayleigh,
+  unsteered,
   baseline: 0.1,
   risky,
   steered: true,
@@ -18,9 +19,9 @@ const tel = (heads: HeadTelemetry[], threshold = 0.2): Telemetry => ({
   summary: {
     mean: heads.reduce((a, b) => a + b.rayleigh, 0) / Math.max(1, heads.length),
     max: Math.max(0, ...heads.map((x) => x.rayleigh)),
+    mean_unsteered: heads.reduce((a, b) => a + b.unsteered, 0) / Math.max(1, heads.length),
     argmax: { layer: 0, head: 0 },
     risk_threshold: threshold,
-    live_over_threshold: 0,
   },
   heads,
 })
@@ -97,12 +98,25 @@ describe('escala del osciloscopio', () => {
     expect(niceCeil(1000)).toBe(1000)
   })
 
-  it('el eje Y auto cubre el máximo de la ventana y el umbral', () => {
+  it('el eje Y auto cubre las trazas con y sin steering, no el umbral τ (otra escala)', () => {
     const buf = new TelemetryBuffer(8)
-    buf.push(0, tel([head(0, 0, 0.04)], 0.08))
-    expect(yMaxFor(buf, 'auto')).toBe(0.1)
+    buf.push(0, tel([head(0, 0, 0.04)], 50))
+    expect(yMaxFor(buf, 'auto')).toBe(0.05) // 0.04 · 1.15 = 0.046; τ = 50 no cuenta
     expect(yMaxFor(buf, 'unit')).toBe(1)
-    buf.push(1, tel([head(0, 0, 230)], 180))
+    buf.push(1, tel([head(0, 0, 3, true, 9)]))
+    expect(yMaxFor(buf, 'auto')).toBe(20) // la referencia sin steering (9) manda: 10.35 -> 20
+    buf.push(2, tel([head(0, 0, 230)], 180))
     expect(yMaxFor(buf, 'auto')).toBe(400) // 230 · 1.15 = 264.5 -> 400
+  })
+
+  it('guarda R(q − δ) por cabeza alineado con R(q)', () => {
+    const buf = new TelemetryBuffer(4)
+    buf.push(0, tel([head(21, 3, 4.2, true, 3.1)]))
+    buf.push(1, tel([]))
+    const s = buf.series.get('21:3')!
+    expect([s.values[0], s.unsteered[0]]).toEqual([expect.closeTo(4.2, 5), expect.closeTo(3.1, 5)])
+    expect(Number.isNaN(s.unsteered[1]!)).toBe(true)
+    expect(buf.unsteeredMax[0]).toBeCloseTo(3.1)
+    expect(Number.isNaN(buf.unsteeredMax[1]!)).toBe(true)
   })
 })

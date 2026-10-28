@@ -240,7 +240,11 @@ librerías de gráficas:
 - **Eje Y:** autoescalado a un tope "redondo" de cualquier década (1, 2, 2.5, 4,
   5 o 7.5 × 10ⁿ); con `normalize_rayleigh`, también puede fijarse a [0, 1]. Las
   etiquetas usan unas tres cifras significativas.
-- **Umbral:** el de riesgo τ, en ámbar.
+- **Referencia sin steering:** en las cabezas con steering, una traza discontinua
+  del mismo color con $R(q - \delta)$, la misma query sin el vector inyectado en su
+  capa. El hueco entre las dos es lo que mueve el steering a esa cabeza. El umbral
+  de riesgo τ no se dibuja: está en la escala de las direcciones de steering, no en
+  la de las queries.
 - **Marcadores de hot-swap:** en violeta.
 - **Una traza por cabeza:**
   - azul: proyectada por SKOP;
@@ -256,7 +260,7 @@ Recorre los `Float32Array` sin crear objetos por punto.
 multiplicando por `devicePixelRatio`, de modo que se ve nítido en pantallas HiDPI.
 
 React sólo vuelve a renderizar el componente al cambiar sus opciones (autoescala,
-media, referencia `r_q`).
+media, referencia sin steering).
 
 ## Estructura de ficheros
 

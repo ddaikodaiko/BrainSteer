@@ -396,6 +396,19 @@ class CircuitController:
         if not changes:
             return None
         e = self.engine
+        checkpoint, layer_features = e.circuit_state(), self._layer_features
+        try:
+            self._apply(changes)
+        except Exception:
+            # Transaccional: un fallo a mitad no deja el circuito medio aplicado.
+            e.restore_circuit_state(checkpoint)
+            self._layer_features = layer_features
+            raise
+        self.version += 1
+        return changes
+
+    def _apply(self, changes: Dict[str, Any]) -> None:
+        e = self.engine
         if "layers" in changes:
             directions, described = self._layer_directions(changes["layers"])
         refit = False
@@ -424,8 +437,6 @@ class CircuitController:
                 e.attach()
             else:
                 e.detach()
-        self.version += 1
-        return changes
 
     def snapshot(self) -> Dict[str, Any]:
         e = self.engine
@@ -458,14 +469,27 @@ def _r(x: float) -> float:
     return round(float(x), 6)
 
 
-def build_telemetry(engine: SKOPEngine, live: Dict[int, torch.Tensor], mode: TelemetryMode) -> Optional[Event]:
-    """Resumen del cociente de Rayleigh en vivo (batch 0) para el token actual."""
+def build_telemetry(
+    engine: SKOPEngine,
+    live: Dict[int, torch.Tensor],
+    mode: TelemetryMode,
+    unsteered: Optional[Dict[int, torch.Tensor]] = None,
+) -> Optional[Event]:
+    """Resumen del cociente de Rayleigh en vivo (batch 0) para el token actual.
+
+    ``rayleigh`` es R(q) de la query con steering y ``unsteered`` R(q − δ) de la misma
+    query sin el vector inyectado: son la misma magnitud y se comparan entre sí.
+    ``baseline`` (R de la dirección de steering) y ``risk_threshold`` son la escala
+    del ranking de riesgo, no la de las queries.
+    """
     if mode == "none":
         return None
     if not live:
         return {"available": False}
+    unsteered = unsteered or live
     layers = sorted(live)
     scores = torch.stack([live[l][0] for l in layers])  # (L, H)
+    base = torch.stack([unsteered[l][0] for l in layers])
     num_heads = scores.shape[1]
     layer_pos, head = divmod(int(scores.argmax()), num_heads)
     threshold = engine.risk_threshold
@@ -474,9 +498,9 @@ def build_telemetry(engine: SKOPEngine, live: Dict[int, torch.Tensor], mode: Tel
         "summary": {
             "mean": _r(scores.mean()),
             "max": _r(scores.max()),
+            "mean_unsteered": _r(base.mean()),
             "argmax": {"layer": layers[layer_pos], "head": head},
             "risk_threshold": None if threshold is None else _r(threshold),
-            "live_over_threshold": None if threshold is None else int((scores > threshold).sum()),
         },
     }
     if mode in ("risky", "all"):
@@ -493,6 +517,7 @@ def build_telemetry(engine: SKOPEngine, live: Dict[int, torch.Tensor], mode: Tel
                         "layer": l,
                         "head": h,
                         "rayleigh": _r(scores[i, h]),
+                        "unsteered": _r(base[i, h]),
                         "baseline": _r(engine.rayleigh[l][h]),
                         "risky": bool(risky[h]),
                         "steered": l in active,
@@ -617,7 +642,7 @@ class GenerationJob:
         index = len(self.token_ids)
         self.token_ids.append(token_id)
         # Telemetría del forward que acaba de producir este token.
-        live = rt.engine.collect_telemetry() if rt.engine.telemetry_attached else {}
+        live, unsteered = rt.engine.collect_telemetry_pair() if rt.engine.telemetry_attached else ({}, {})
         self.emit({
             "type": "token",
             "request_id": self.request_id,
@@ -625,7 +650,7 @@ class GenerationJob:
             "token": self._decode_delta(),
             "token_id": token_id,
             "circuit_version": rt.circuit.version,
-            "telemetry": build_telemetry(rt.engine, live, self.request.telemetry),
+            "telemetry": build_telemetry(rt.engine, live, self.request.telemetry, unsteered),
         })
         rt.apply_circuit(applied_at_index=index, request_id=self.request_id)
 

@@ -6,6 +6,8 @@ export interface HeadSeries {
   head: number
   /** Ring buffer alineado con `TelemetryBuffer.tokens`; NaN = sin dato. */
   values: Float32Array
+  /** R(q − δ) de la misma cabeza sin el vector inyectado, alineado con `values`. */
+  unsteered: Float32Array
   baseline: number
   steered: boolean
   projected: boolean
@@ -35,6 +37,8 @@ export class TelemetryBuffer {
   readonly tokens: Int32Array
   readonly mean: Float32Array
   readonly max: Float32Array
+  /** Máximo de R(q − δ) entre las series de cada muestra (para la escala Y). */
+  readonly unsteeredMax: Float32Array
   readonly series = new Map<string, HeadSeries>()
   markers: ScopeMarker[] = []
 
@@ -43,6 +47,7 @@ export class TelemetryBuffer {
     this.tokens = new Int32Array(capacity)
     this.mean = new Float32Array(capacity).fill(Number.NaN)
     this.max = new Float32Array(capacity).fill(Number.NaN)
+    this.unsteeredMax = new Float32Array(capacity).fill(Number.NaN)
   }
 
   reset(requestId: string | null = null): void {
@@ -52,6 +57,7 @@ export class TelemetryBuffer {
     this.lastTokenIndex = null
     this.mean.fill(Number.NaN)
     this.max.fill(Number.NaN)
+    this.unsteeredMax.fill(Number.NaN)
     this.series.clear()
     this.markers = []
     this.version++
@@ -72,6 +78,7 @@ export class TelemetryBuffer {
     this.tokens[slot] = tokenIndex
     this.lastTokenIndex = tokenIndex
     const seen = new Set<string>()
+    let unsteeredMax = Number.NaN
 
     if (telemetry?.available) {
       this.mean[slot] = telemetry.summary.mean
@@ -81,6 +88,8 @@ export class TelemetryBuffer {
         if (!head.risky) continue
         const s = this.ensureSeries(head)
         s.values[slot] = head.rayleigh
+        s.unsteered[slot] = head.unsteered
+        if (Number.isFinite(head.unsteered) && !(head.unsteered <= unsteeredMax)) unsteeredMax = head.unsteered
         s.last = head.rayleigh
         s.baseline = head.baseline
         s.steered = head.steered
@@ -94,9 +103,11 @@ export class TelemetryBuffer {
     for (const s of this.series.values()) {
       if (!seen.has(s.key)) {
         s.values[slot] = Number.NaN
+        s.unsteered[slot] = Number.NaN
         s.last = Number.NaN
       }
     }
+    this.unsteeredMax[slot] = unsteeredMax
     this.samples++
     // Descarta marcadores que ya salieron de la ventana.
     const oldest = this.samples - this.capacity
@@ -130,6 +141,7 @@ export class TelemetryBuffer {
         layer: head.layer,
         head: head.head,
         values: new Float32Array(this.capacity).fill(Number.NaN),
+        unsteered: new Float32Array(this.capacity).fill(Number.NaN),
         baseline: head.baseline,
         steered: head.steered,
         projected: head.projected,

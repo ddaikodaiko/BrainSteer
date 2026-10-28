@@ -17,7 +17,6 @@ const GRID = 'rgba(57, 245, 180, 0.06)'
 const GRID_MAJOR = 'rgba(57, 245, 180, 0.14)'
 const TEXT = '#5d6b80'
 const SIGNAL = '#39f5b4'
-const THRESHOLD = '#fbbf24'
 const MARKER = '#a78bfa'
 const FONT = '10px "JetBrains Mono", ui-monospace, Menlo, monospace'
 /** Mantisas "redondas" de una década. */
@@ -43,9 +42,10 @@ export function windowStart(buf: TelemetryBuffer): number {
 
 export function yMaxFor(buf: TelemetryBuffer, scale: ScopeScale): number {
   if (scale === 'unit') return 1
-  let max = buf.threshold ?? 0
+  let max = 0
   for (let s = windowStart(buf); s < buf.samples; s++) {
-    const v = buf.max[buf.slot(s)]!
+    const slot = buf.slot(s)
+    const v = Math.max(buf.max[slot]!, buf.unsteeredMax[slot]!)
     if (v > max) max = v
   }
   return niceCeil(max * 1.15)
@@ -112,18 +112,8 @@ export function drawScope(ctx: CanvasRenderingContext2D, buf: TelemetryBuffer, v
     ctx.fillText(m.label, x + 3, PAD.t + 2)
   }
 
-  // Umbral de riesgo (percentil de calibración, en la misma escala que las trazas).
-  if (buf.threshold !== null && buf.threshold <= yMax) {
-    const y = Math.round(yOf(buf.threshold)) + 0.5
-    ctx.strokeStyle = THRESHOLD
-    ctx.globalAlpha = 0.75
-    line(ctx, PAD.l, y, PAD.l + plotW, y)
-    ctx.globalAlpha = 1
-    ctx.fillStyle = THRESHOLD
-    ctx.textAlign = 'right'
-    ctx.textBaseline = 'bottom'
-    ctx.fillText(`τ ${fmt(buf.threshold)}`, PAD.l + plotW - 2, y - 2)
-  }
+  // El umbral de riesgo τ no se dibuja: es la escala de R(r) de las direcciones de
+  // steering, no la de R(q) de las queries que muestran estas trazas.
   ctx.setLineDash([])
 
   // Trazas por cabeza de riesgo.
@@ -136,11 +126,14 @@ export function drawScope(ctx: CanvasRenderingContext2D, buf: TelemetryBuffer, v
     ctx.lineWidth = s.steered ? 1.6 : 1
     ctx.strokeStyle = seriesColor(s, rankOf.get(s.key) ?? 0, s.steered ? 0.95 : 0.75)
     tracePath(ctx, buf, s.values, s0, xOf, yOf)
-    if (view.showBaseline && Number.isFinite(s.baseline) && s.baseline <= yMax) {
-      // Referencia de calibración r_q: marca en el borde derecho.
-      const y = yOf(s.baseline)
+    if (view.showBaseline && s.steered) {
+      // Referencia: la misma cabeza sin el vector inyectado, R(q − δ). El hueco entre
+      // las dos trazas es lo que mueve el steering a esa cabeza.
+      ctx.setLineDash([3, 3])
+      ctx.lineWidth = 1
       ctx.strokeStyle = seriesColor(s, rankOf.get(s.key) ?? 0, 0.5)
-      line(ctx, PAD.l + plotW + 2, y, PAD.l + plotW + 8, y)
+      tracePath(ctx, buf, s.unsteered, s0, xOf, yOf)
+      ctx.setLineDash([])
     }
   }
 

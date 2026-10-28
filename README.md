@@ -215,7 +215,9 @@ error, no se reinterpreta). El servidor adopta las capas del artefacto: las anun
 en `ready.layers` y responde `invalid_layer` a cualquier otra.
 
 El artefacto es `latentflow.skop/v3` (Focus Set por masa, media por pasos y
-$\Sigma_{\Delta K}$ por cabeza de query). Los de la versión anterior (`v2`) se
+$\Sigma_{\Delta K}$ por cabeza de query). Guarda también γ, el percentil de riesgo y
+la normalización de Rayleigh con los que se calibró, y el servidor los usa al
+cargarlo. Los de la versión anterior (`v2`) se
 rechazan al cargar: hay que regenerarlos con `latentflow-calibrate`.
 
 Antes de abrir la cabina puedes ver el efecto de `r_q` con `latentflow-probe`: genera
@@ -322,8 +324,10 @@ $$
 R_h(r) = \frac{r^{\top} \Sigma_{\Delta K}\, r}{\lVert r \rVert^2 + \varepsilon} \;\in\; \big[\lambda_{\min},\, \lambda_{\max}\big].
 $$
 
-Las cabezas por encima del percentil 80 global (todas las capas calibradas) son de
-riesgo. `SKOPConfig(normalize_rayleigh=True)` usa en su lugar
+Las cabezas por encima del percentil 80 son de riesgo. El percentil se calcula entre
+las cabezas de las capas que reciben steering: todas en modo global, como en el
+paper, o sólo las del plan por capa, para que una capa activa no se quede sin
+cabezas de riesgo porque el 20 % cae en capas que nadie está dirigiendo. `SKOPConfig(normalize_rayleigh=True)` usa en su lugar
 $\hat\Sigma = \Sigma_{\Delta K} / (\operatorname{tr}\Sigma_{\Delta K} + \varepsilon)$, que acota
 $R_h$ en $[0, 1]$ y lo hace comparable entre capas de escalas distintas. Es una
 opción nuestra, desactivada por defecto.
@@ -544,14 +548,14 @@ texto se emite con el token siguiente.
   "telemetry": {
     "available": true,
     "summary": {
-      "mean": 0.031,
-      "max": 0.087,
+      "mean": 3.12,
+      "max": 8.71,
+      "mean_unsteered": 2.95,
       "argmax": { "layer": 21, "head": 3 },
-      "risk_threshold": 0.043,
-      "live_over_threshold": 5
+      "risk_threshold": 4.886
     },
     "heads": [
-      { "layer": 21, "head": 3, "rayleigh": 0.087, "baseline": 0.052, "risky": true, "steered": true, "projected": true }
+      { "layer": 21, "head": 3, "rayleigh": 8.71, "unsteered": 6.02, "baseline": 5.2, "risky": true, "steered": true, "projected": true }
     ]
   }
 }
@@ -560,12 +564,13 @@ texto se emite con el token siguiente.
 | Campo | Significado |
 | --- | --- |
 | `rayleigh` | $R_h(q)$ de la query **actual** (ya steerada) de esa cabeza: energía absoluta ≥ 0, o en [0, 1] si `normalize_rayleigh` |
+| `unsteered` | $R_h(q - \delta)$: la misma query sin el vector $\delta$ inyectado en su capa. Misma escala que `rayleigh`; la diferencia es lo que mueve el steering a esa cabeza (el efecto de las capas anteriores sigue dentro de las dos) |
 | `baseline` | $R_h(r)$ de la dirección de steering de la capa (calibración o feature) |
-| `risky` | La cabeza supera el percentil de riesgo global |
+| `risky` | La cabeza está en el top 20 % de riesgo entre las capas con steering |
 | `steered` | Su capa recibe steering |
 | `projected` | Recibe $P_{\Delta K}\, r$: es de riesgo, su capa está en modo `orthogonal` y el steering está activo |
-| `summary.risk_threshold` | Umbral $\tau_R$ del ranking, en la misma escala que `rayleigh` |
-| `summary.live_over_threshold` | Cabezas cuyo $R_h(q)$ en vivo supera $\tau_R$ |
+| `summary.mean_unsteered` | Media de `unsteered`, comparable con `summary.mean` |
+| `summary.risk_threshold` | Umbral $\tau_R$ del ranking, en la escala de `baseline` (direcciones), **no** en la de `rayleigh` (queries) |
 
 El campo `telemetry` depende del modo: `none` → `null`; `summary` → sin `heads`;
 `risky` → sólo cabezas de riesgo; `all` → todas. Si el servidor no está calibrado
@@ -592,7 +597,7 @@ lista de `{layer, alpha, mode, features?}`. Cada feature trae `source`, que vale
 | `invalid_layer` | Capa no calibrada (incluye `valid_layers`) |
 | `feature_not_found` | No hay pesos locales del SAE (el mensaje incluye las rutas buscadas y el comando de descarga) |
 | `feature_invalid` | ID mal formado, SAE de atención, dimensión distinta de `d_model` o índice fuera de rango |
-| `circuit_apply_failed` | Fallo al aplicar el circuito en el worker; la generación en curso continúa |
+| `circuit_apply_failed` | Fallo al aplicar el circuito en el worker. El cambio se deshace entero (el circuito queda como antes) y la generación en curso continúa |
 | `prompt_too_long` | El prompt supera `LATENTFLOW_MAX_PROMPT_TOKENS` |
 | `generation_failed` | Excepción durante la generación; le sigue `end` con `reason: "error"` |
 | `calibration_failed`, `no_tokenizer` | Fallos de la acción `calibrate` |

@@ -43,7 +43,8 @@ Pipeline
    ``R_h = r_hᵀ Σ r_h / (‖r_h‖² + ε)``: la energía absoluta de la perturbación del
    gap Focus/Tail por unidad de norma (``normalize_rayleigh=True`` usa
    ``Σ / tr(Σ)``, opcional). Las cabezas por encima del percentil
-   ``risk_percentile`` (top 20 % por defecto, global sobre todas las capas) reciben
+   ``risk_percentile`` (top 20 % por defecto) entre las de las capas que reciben
+   steering (todas en modo global, como en el paper) reciben
    ``q' = q + α P_ΔK r_q``; el resto, ``q' = q + α r_q``.
 
 Por qué funciona: ``q'·Δk = q·Δk + α (P_ΔK r_q)·Δk``. Como ``P_ΔK`` anula el
@@ -79,7 +80,7 @@ Uso
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -102,6 +103,9 @@ __all__ = [
 ]
 
 DEFAULT_MODEL_ID = "google/gemma-2-2b-it"
+
+#: Hiperparámetros del ajuste (proyectores y riesgo) que viajan con el artefacto.
+FIT_CONFIG_KEYS = ("gamma_energy", "risk_percentile", "normalize_rayleigh")
 
 #: Formato del artefacto de ``SKOPEngine.save()``. v3: Focus Set por masa acumulada,
 #: media por pasos y Σ_ΔK por cabeza de query (v2 no se puede convertir: recalibra).
@@ -595,7 +599,7 @@ class SKOPEngine:
             plan = {int(l): (float(a), bool(p)) for l, (a, p) in plan.items()}
         self._layer_plan = plan
         if self._effective:
-            self._build_effective_vectors()
+            self.compute_risk()  # el top 20 % se calcula sobre las capas activas
         self._cast_cache.clear()
         if self.is_attached:
             self.attach()
@@ -688,6 +692,45 @@ class SKOPEngine:
         if self.projectors and all(l in self.steering_vectors or l in overrides for l in self.layer_ids):
             self.compute_risk()
         return self
+
+    def circuit_state(self) -> Dict[str, Any]:
+        """Copia ligera del estado mutable del circuito, para deshacer un cambio a medias.
+
+        Copia los diccionarios, no los tensores: el motor nunca modifica un tensor en
+        su sitio, siempre los sustituye.
+        """
+        return {
+            "config": replace(self.config),
+            "alpha": self._alpha,
+            "use_projection": self._use_projection,
+            "layer_plan": None if self._layer_plan is None else dict(self._layer_plan),
+            "directions": dict(self._direction_override),
+            "projectors": dict(self.projectors),
+            "rayleigh": dict(self.rayleigh),
+            "risk_mask": dict(self.risk_mask),
+            "risk_threshold": self.risk_threshold,
+            "effective": dict(self._effective),
+            "risk_sigma": dict(self._risk_sigma),
+            "attached": self.is_attached,
+        }
+
+    def restore_circuit_state(self, state: Mapping[str, Any]) -> None:
+        """Vuelve al estado de ``circuit_state()``, hooks incluidos."""
+        self.config = state["config"]
+        self._alpha = state["alpha"]
+        self._use_projection = state["use_projection"]
+        self._layer_plan = state["layer_plan"]
+        self._direction_override = dict(state["directions"])
+        self.projectors = dict(state["projectors"])
+        self.rayleigh = dict(state["rayleigh"])
+        self.risk_mask = dict(state["risk_mask"])
+        self.risk_threshold = state["risk_threshold"]
+        self._effective = dict(state["effective"])
+        self._risk_sigma = dict(state["risk_sigma"])
+        self._cast_cache.clear()
+        self.detach()
+        if state["attached"]:
+            self.attach()
 
     @property
     def is_attached(self) -> bool:
@@ -919,7 +962,12 @@ class SKOPEngine:
         return self
 
     def compute_risk(self) -> "SKOPEngine":
-        """Cociente de Rayleigh por cabeza de query y máscara global top-(1-p)."""
+        """Cociente de Rayleigh por cabeza de query y máscara top-(1-p).
+
+        El percentil se calcula sobre las cabezas de ``active_layers``: todas las
+        capas calibradas en modo global (el ranking global del paper) o sólo las del
+        plan por capa. Las capas sin steering no compiten por el 20 % ni se marcan.
+        """
         if not self.projectors or not (self.steering_vectors or self._direction_override):
             raise RuntimeError("Faltan proyectores o vectores de steering")
         for l in self.layer_ids:
@@ -928,10 +976,13 @@ class SKOPEngine:
                 sigma = trace_normalize(sigma, self.config.rayleigh_eps)
             self._risk_sigma[l] = sigma
             self.rayleigh[l] = rayleigh_quotient(self._risk_sigma[l], self.direction_for(l), self.config.eps)
-        scores = torch.stack([self.rayleigh[l] for l in self.layer_ids])  # (L, H)
-        mask, self.risk_threshold = select_risky_heads(scores, self.config.risk_percentile)
-        for i, l in enumerate(self.layer_ids):
-            self.risk_mask[l] = mask[i]
+        active = self.active_layers
+        scores = torch.stack([self.rayleigh[l] for l in active])  # (L_activas, H)
+        _, self.risk_threshold = select_risky_heads(scores, self.config.risk_percentile)
+        for l in self.layer_ids:
+            self.risk_mask[l] = (
+                self.rayleigh[l] > self.risk_threshold if l in active else torch.zeros_like(self.rayleigh[l], dtype=torch.bool)
+            )
         self._build_effective_vectors()
         return self
 
@@ -1022,20 +1073,38 @@ class SKOPEngine:
 
     @torch.no_grad()
     def collect_telemetry(self, clear: bool = True) -> Dict[int, Tensor]:
-        """Cociente de Rayleigh en vivo de la query actual, por capa: (B, H) float64.
+        """Cociente de Rayleigh en vivo de la query actual (ya steerada), por capa: (B, H)."""
+        return self.collect_telemetry_pair(clear)[0]
 
-        Usa la misma Σ (normalizada por traza si procede) que el ranking de riesgo,
-        así que es directamente comparable con ``rayleigh`` y ``risk_threshold``.
+    @torch.no_grad()
+    def collect_telemetry_pair(self, clear: bool = True) -> Tuple[Dict[int, Tensor], Dict[int, Tensor]]:
+        """``R(q)`` de la query actual con steering y ``R(q − δ)`` de la misma query sin
+        él, por capa: (B, H) float64 cada uno.
+
+        ``δ`` es exactamente el vector que sumó el hook de steering de esa capa (en las
+        capas sin steering, ``q − δ = q``). Las dos usan la misma Σ que el ranking, así
+        que su diferencia mide cuánto mueve la inyección de esa capa a cada cabeza en el
+        subespacio Focus/Tail. El efecto de las capas anteriores, que llega por el
+        residual stream, sigue dentro de ambas. ``rayleigh`` y ``risk_threshold`` se
+        refieren a las direcciones de steering, no a queries: no son comparables con
+        estos valores.
         """
         g = self.geometry
+        steered_layers = set(self.active_layers) if self.is_attached else set()
         live: Dict[int, Tensor] = {}
+        base: Dict[int, Tensor] = {}
         for l, q in self._probe.items():
             qh = q.to(device="cpu", dtype=_MATH_DTYPE).reshape(q.shape[0], g.num_heads, g.head_dim)
             sigma = self._risk_sigma[l].expand(qh.shape[0], -1, -1, -1)
             live[l] = rayleigh_quotient(sigma, qh, self.config.eps)
+            if l in steered_layers:
+                delta = self._steering_tensor(l, q.device, q.dtype).to(device="cpu", dtype=_MATH_DTYPE)
+                base[l] = rayleigh_quotient(sigma, qh - delta.view(1, g.num_heads, g.head_dim), self.config.eps)
+            else:
+                base[l] = live[l]
         if clear:
             self._probe.clear()
-        return live
+        return live, base
 
     # ------------------------------------------------------------ inspección
     def summary(self) -> Dict[str, Any]:
@@ -1070,6 +1139,7 @@ class SKOPEngine:
             "layer_ids": list(self.layer_ids),
             "geometry": vars(self.geometry).copy(),
             "tau_high": self.config.tau_high,
+            "fit_config": {k: getattr(self.config, k) for k in FIT_CONFIG_KEYS},
             "num_utility_samples": self.num_utility_samples,
             "num_delta_steps": self.num_delta_steps,
             "num_concept_pairs": self.num_concept_pairs,
@@ -1078,7 +1148,16 @@ class SKOPEngine:
             "meta": dict(metadata or {}),
         }
 
-    def load_state_dict(self, state: Mapping[str, Any], fit: bool = True) -> "SKOPEngine":
+    def load_state_dict(
+        self, state: Mapping[str, Any], fit: bool = True, use_saved_fit_config: bool = True
+    ) -> "SKOPEngine":
+        """Carga un artefacto de ``state_dict``/``save``.
+
+        Con ``use_saved_fit_config`` (por defecto), γ, el percentil de riesgo y la
+        normalización de Rayleigh pasan a ser los del artefacto, es decir, los de la
+        calibración (p. ej. ``latentflow-calibrate --gamma 0.8``). Los artefactos v3
+        anteriores, sin ``fit_config``, conservan la configuración del motor.
+        """
         if state.get("format") != ARTIFACT_FORMAT:
             raise ValueError(
                 f"Artefacto de calibración con formato {state.get('format')!r}; se esperaba "
@@ -1086,6 +1165,10 @@ class SKOPEngine:
             )
         if state["geometry"] != vars(self.geometry):
             raise ValueError("La calibración pertenece a un modelo con otra geometría de atención")
+        saved_fit = state.get("fit_config") or {}
+        if use_saved_fit_config and saved_fit:
+            # replace() pasa por __post_init__: un valor fuera de rango no se acepta.
+            self.config = replace(self.config, **{k: saved_fit[k] for k in FIT_CONFIG_KEYS if k in saved_fit})
         saved = _check_layer_ids(state["layer_ids"], len(self.decoder_layers))
         if self.config.layers is None:
             # Sin capas pedidas, el motor adopta las del artefacto (p. ej. `--layers 0,2`).

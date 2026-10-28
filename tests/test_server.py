@@ -128,6 +128,7 @@ def test_generate_streams_tokens_with_risk_telemetry(client):
         assert tel["available"] is True
         # Energía absoluta de Rayleigh (SKOP): no negativa, sin cota superior fija.
         assert 0.0 <= tel["summary"]["mean"] <= tel["summary"]["max"]
+        assert "mean_unsteered" in tel["summary"] and "live_over_threshold" not in tel["summary"]
         assert {(h["layer"], h["head"]) for h in tel["heads"]} == risky
         assert all(h["projected"] and h["risky"] and h["rayleigh"] >= 0.0 for h in tel["heads"])
 
@@ -642,6 +643,10 @@ def test_sae_feature_update_injects_mapped_decoder_direction(client):
     assert all(h["steered"] for h in layer1)
     assert [h["baseline"] for h in layer1] == pytest.approx(engine.rayleigh[1].tolist(), abs=1e-6)
     assert all(h["projected"] == h["risky"] for h in layer1)  # P_ΔK sólo en cabezas de riesgo
+    # #10: la referencia en vivo es la misma query sin el vector inyectado en su capa.
+    assert any(abs(h["rayleigh"] - h["unsteered"]) > 1e-6 for h in layer1)
+    unsteered_layers = [h for h in heads if not h["steered"]]
+    assert unsteered_layers and all(h["rayleigh"] == h["unsteered"] for h in unsteered_layers)
 
 
 def test_feature_slider_hot_swap_during_stream():
@@ -752,6 +757,30 @@ def test_feature_spec_validation(client):
         accepted = recv_until(ws, lambda m: m["type"] in ("update_accepted", "error"))[-1]
         assert accepted["type"] == "update_accepted"
         assert accepted["features"] == [{"feature_id": "mi-feature-libre", "source": "dev-hash", "sae_layer": None}]
+
+
+def test_failed_apply_rolls_back_the_whole_change(client, monkeypatch):
+    """#4: si un cambio fallaba a mitad, el circuito quedaba medio aplicado."""
+    runtime = client.app.state.runtime
+    circuit, engine = runtime.circuit, runtime.engine
+    circuit.request({"steering": True})
+    circuit.apply_pending()
+    before = circuit.snapshot()
+    ranks = {l: engine.projectors[l].rank.clone() for l in engine.layer_ids}
+
+    def boom(plan):
+        raise RuntimeError("fallo inyectado")
+
+    monkeypatch.setattr(engine, "set_layer_plan", boom)
+    circuit.request({"alpha": 7.0, "gamma_energy": 0.5, "risk_percentile": 0.5, "layers": feature_layers()},
+                    {FID: HashFeatureResolver().resolve(FID, HIDDEN_TEST)})
+    with pytest.raises(RuntimeError, match="fallo inyectado"):
+        circuit.apply_pending()
+    monkeypatch.undo()
+    assert circuit.snapshot() == before  # versión, α, γ, percentil, plan, riesgo
+    assert engine.layer_directions == {} and engine.is_attached
+    assert len(engine._handles) == len(engine.layer_ids)
+    assert all(torch.equal(engine.projectors[l].rank, ranks[l]) for l in engine.layer_ids)
 
 
 def test_merged_pending_updates_keep_the_latest_layer_intent(client):

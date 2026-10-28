@@ -472,6 +472,30 @@ def test_live_telemetry_sees_steered_query_regardless_of_hook_order(calibrated_e
     assert e.collect_telemetry() == {}  # clear=True vacía el buffer
 
 
+def test_unsteered_telemetry_removes_exactly_the_injected_vector(calibrated_engine):
+    """#10: R(q − δ) durante el forward con steering = R(q) de un forward sin él,
+    en la capa inyectada; las capas sin steering conservan el efecto que les llega."""
+    e = calibrated_engine
+    batch = random_batch(n=2, t=5, seed=9)
+    e.set_layer_plan({1: (3.0, True)})
+    e.attach_telemetry()
+    e.attach()
+    with torch.no_grad():
+        e.model(**batch)
+    live, base = e.collect_telemetry_pair()
+    e.detach()
+    with torch.no_grad():
+        e.model(**batch)
+    clean = e.collect_telemetry()
+    e.detach_telemetry()
+    torch.testing.assert_close(base[1], clean[1], rtol=1e-5, atol=1e-6)  # se quita δ exacto
+    assert not torch.allclose(live[1], base[1])                           # y δ sí movía la cabeza
+    torch.testing.assert_close(base[0], live[0])                          # capa 0: sin steering, sin efecto
+    torch.testing.assert_close(clean[0], live[0], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(base[2], live[2])                          # capa 2: sin inyección propia...
+    assert not torch.allclose(live[2], clean[2])                          # ...pero le llega la de la capa 1
+
+
 # --------------------------------------------------------------------------- #
 # Plan por capa (alpha y modo propios por capa)
 # --------------------------------------------------------------------------- #
@@ -500,6 +524,23 @@ def test_layer_plan_hooks_only_planned_layers_with_own_alpha_and_mode(calibrated
     e.set_layer_plan(None)
     assert e.active_layers == e.layer_ids
     torch.testing.assert_close(e.effective_vectors()[0][0], e.alpha * e._effective[0].reshape(N_HEADS, HEAD_DIM)[0])
+
+
+def test_risk_percentile_is_taken_over_the_steered_layers_only(calibrated_engine):
+    """#9: con un plan de una capa, el top 20 % global caía en otras capas y la capa
+    activa podía quedarse sin cabezas de riesgo (la proyección no hacía nada)."""
+    e = calibrated_engine
+    weakest = min(e.layer_ids, key=lambda l: float(e.rayleigh[l].max()))
+    e.set_layer_plan({weakest: (2.0, True)})
+    scores = e.rayleigh[weakest]
+    assert e.risk_threshold == pytest.approx(torch.quantile(scores, 0.8).item())
+    assert int(e.risk_mask[weakest].sum()) == 1  # el 20 % de sus 4 cabezas
+    assert all(not e.risk_mask[l].any() for l in e.layer_ids if l != weakest)
+    head = int(scores.argmax())
+    torch.testing.assert_close(e.effective_vectors()[weakest][head],
+                               2.0 * e.projectors[weakest].projector[head] @ e.steering_vectors[weakest][head])
+    e.set_layer_plan(None)  # modo global: vuelve el ranking sobre todas las capas
+    assert sum(int(e.risk_mask[l].sum()) for l in e.layer_ids) == 3
 
 
 def test_layer_plan_rejects_uncalibrated_layers():
@@ -753,6 +794,28 @@ def test_explicit_layers_load_their_slice_or_fail_if_not_covered():
 def test_layers_out_of_range_are_rejected_instead_of_wrapping(layers):
     with pytest.raises(ValueError, match="fuera de rango"):
         SKOPEngine(TinyCausalLM(), SKOPConfig(layers=layers))
+
+
+def test_artifact_carries_its_fit_config():
+    """#2: γ y el percentil de la calibración se perdían al cargar el artefacto."""
+    torch.manual_seed(6)
+    model = TinyCausalLM().eval()
+    config = SKOPConfig(gamma_energy=0.7, risk_percentile=0.5, normalize_rayleigh=True)
+    source = calibrate_tiny(SKOPEngine(model, config)).fit()
+    state = source.state_dict()
+    assert state["fit_config"] == {"gamma_energy": 0.7, "risk_percentile": 0.5, "normalize_rayleigh": True}
+
+    loaded = SKOPEngine(model).load_state_dict(state)  # servidor: configuración por defecto
+    assert (loaded.config.gamma_energy, loaded.config.risk_percentile, loaded.config.normalize_rayleigh) == (0.7, 0.5, True)
+    assert loaded.risk_threshold == pytest.approx(source.risk_threshold)
+    for l in source.layer_ids:
+        assert torch.equal(loaded.projectors[l].rank, source.projectors[l].rank)
+        assert torch.equal(loaded.risk_mask[l], source.risk_mask[l])
+
+    kept = SKOPEngine(model).load_state_dict(state, use_saved_fit_config=False)
+    assert (kept.config.gamma_energy, kept.config.risk_percentile) == (0.9, 0.8)
+    del state["fit_config"]  # artefacto v3 anterior a este campo
+    assert SKOPEngine(model).load_state_dict(state).config.gamma_energy == 0.9
 
 
 def test_defaults_follow_the_skop_paper():

@@ -74,8 +74,8 @@ describe('handleServerMessage', () => {
         circuit_version: 1,
         telemetry: {
           available: true,
-          summary: { mean: 0.1, max: 0.3, argmax: { layer: 12, head: 1 }, risk_threshold: 0.2, live_over_threshold: 1 },
-          heads: [{ layer: 12, head: 1, rayleigh: 0.3, baseline: 0.25, risky: true, steered: true, projected: true }],
+          summary: { mean: 0.1, max: 0.3, mean_unsteered: 0.08, argmax: { layer: 12, head: 1 }, risk_threshold: 0.2 },
+          heads: [{ layer: 12, head: 1, rayleigh: 0.3, unsteered: 0.2, baseline: 0.25, risky: true, steered: true, projected: true }],
         },
       })
     }
