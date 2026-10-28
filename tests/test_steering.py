@@ -696,6 +696,22 @@ def test_sigma_does_not_depend_on_contrastive_pairs():
     assert only_utility.steering_vectors == {} and with_concept.num_concept_pairs == 6
 
 
+def test_concept_direction_matches_the_calibration_mean_difference():
+    torch.manual_seed(8)
+    model = TinyCausalLM().eval()
+    pairs = [(random_batch(n=3, seed=40 + i), random_batch(n=3, seed=60 + i)) for i in range(3)]
+    calibrated = SKOPEngine(model)
+    calibrated.accumulate_utility_batch(random_batch(n=4, t=10, seed=1))
+    for pos, neg in pairs:
+        calibrated.accumulate_concept_batch(pos, neg)
+    calibrated.finalize_calibration()
+    direction = SKOPEngine(model).concept_direction(pairs)
+    for l in calibrated.layer_ids:
+        torch.testing.assert_close(direction[l], calibrated.steering_vectors[l])
+    with pytest.raises(ValueError, match="al menos un par"):
+        SKOPEngine(model).concept_direction([])
+
+
 def test_fit_with_external_concept_direction():
     torch.manual_seed(5)
     model = TinyCausalLM().eval()

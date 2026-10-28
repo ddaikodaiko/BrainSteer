@@ -24,6 +24,7 @@ latentflow-server = "latentflow.api.server:main"
 latentflow-dev = "latentflow.tools.dev_backend:main"
 latentflow-calibrate = "latentflow.tools.initializer:main"
 latentflow-probe = "latentflow.tools.probe:main"
+latentflow-eval = "latentflow.tools.evaluate:main"
 
 [tool.setuptools.packages.find]
 include = ["latentflow*"]

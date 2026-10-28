@@ -65,6 +65,7 @@ flowchart LR
 | [`latentflow/api/server.py`](latentflow/api/server.py) | Servidor FastAPI + WebSocket: streaming, hot-swap, plan por capa, protección de Origin |
 | [`latentflow/tools/initializer.py`](latentflow/tools/initializer.py) | CLI `latentflow-calibrate`: genera el artefacto de calibración a partir de datasets locales |
 | [`latentflow/tools/probe.py`](latentflow/tools/probe.py) | CLI `latentflow-probe`: compara generaciones sin steering y con cada α (vanilla y SKOP) para un prompt |
+| [`latentflow/tools/evaluate.py`](latentflow/tools/evaluate.py) | CLI `latentflow-eval`: steering (MWE A/B), utilidad (ARC) y masa del Focus Set en un barrido de α, vanilla frente a SKOP |
 | [`latentflow/tools/dev_backend.py`](latentflow/tools/dev_backend.py) | CLI `latentflow-dev`: el mismo servidor sobre un modelo tiny, sin GPU |
 | [`frontend/`](frontend/README.md) | Cabina visual: canvas de nodos, chat, osciloscopio |
 
@@ -230,6 +231,32 @@ latentflow-probe --calibration calib/gemma2_skop.pt \
     --prompt "Write a short email to my boss asking for a day off." \
     --alphas 0,2,-2,4,-4,8,-8 --modes additive,skop -o probe.jsonl
 ```
+
+### 5b. Evaluar steering y utilidad
+
+`latentflow-eval` compara steering vanilla (`additive`) y SKOP en un barrido de α,
+con tres medidas por cada comportamiento:
+
+| Medida | Datos | Qué es |
+| --- | --- | --- |
+| Steering | [Model-Written Evaluations](https://github.com/anthropics/evals) de Anthropic (preguntas A/B) | Probabilidad de la opción que muestra el comportamiento (azar: 0.5). La dirección `r_q` se estima con otras preguntas del mismo fichero |
+| Utilidad | ARC-Easy (opción múltiple) | Acierto, puntuando cada opción por su log-verosimilitud |
+| Mecanismo | Los mismos prompts de ARC | $\Delta M$ (Ec. 8 del paper): cambio de la masa de atención sobre el Focus Set del modelo base, por cabeza y paso; media y fracción que pierde ≥ 10, 15 o 25 puntos |
+
+```bash
+git clone --depth 1 https://github.com/anthropics/evals data/anthropic-evals
+python -c "from datasets import load_dataset; load_dataset('allenai/ai2_arc', 'ARC-Easy', split='test').to_json('data/arc_easy_test.jsonl')"
+latentflow-eval --calibration calib/gemma2_skop.pt \
+    --behavior data/anthropic-evals/advanced-ai-risk/human_generated_evals/corrigible-less-HHH.jsonl \
+    --behavior data/anthropic-evals/advanced-ai-risk/human_generated_evals/power-seeking-inclination.jsonl \
+    --behavior data/anthropic-evals/advanced-ai-risk/human_generated_evals/wealth-seeking-inclination.jsonl \
+    --utility data/arc_easy_test.jsonl --alphas=-3,-2,-1,1,2,3 -o results/eval.csv
+```
+
+Escribe una fila por (comportamiento, modo, α) en el CSV, también a medida que
+avanza. Diferencias con el paper: puntúa por probabilidad de la opción en vez de con
+un juez LLM, usa ARC-Easy como utilidad y mide $\Delta M$ con teacher forcing en vez
+de en pasos de decodificación.
 
 ### 6. Arrancar el servidor
 

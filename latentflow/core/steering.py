@@ -81,7 +81,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -855,6 +855,33 @@ class SKOPEngine:
         q_neg = self._capture_queries(negative_inputs)
         for l in self.layer_ids:
             self._rq_acc[l].update(q_pos[l].to(_MATH_DTYPE) - q_neg[l].to(_MATH_DTYPE))
+
+    @torch.no_grad()
+    def concept_direction(
+        self, batches: Iterable[Tuple[Mapping[str, Tensor], Mapping[str, Tensor]]]
+    ) -> Dict[int, Tensor]:
+        """``r_q = E[q_pos − q_neg]`` de pares ya tokenizados, sin tocar la calibración.
+
+        Estima la dirección de un comportamiento (p. ej. pares A/B de las Model-Written
+        Evaluations) sobre el mismo Σ_ΔK, para pasarla a ``fit(steering_vectors=...)``.
+        Cada elemento de ``batches`` es ``(positivos, negativos)`` con la misma forma que
+        ``accumulate_concept_batch``. Returns: ``{capa: (H, d)}`` en float64/CPU.
+        """
+        g = self.geometry
+        sums = {l: torch.zeros(g.num_heads, g.head_dim, dtype=_MATH_DTYPE) for l in self.layer_ids}
+        count = 0
+        for positive, negative in batches:
+            q_pos = self._capture_queries(positive)
+            q_neg = self._capture_queries(negative)
+            for l in self.layer_ids:
+                sums[l] += (q_pos[l].to(_MATH_DTYPE) - q_neg[l].to(_MATH_DTYPE)).sum(0)
+            count += int(positive["input_ids"].shape[0])
+        if count == 0:
+            raise ValueError("concept_direction necesita al menos un par")
+        directions = {l: v / count for l, v in sums.items()}
+        if self.config.normalize_steering:
+            directions = {l: v / v.norm(dim=-1, keepdim=True).clamp_min(self.config.eps) for l, v in directions.items()}
+        return directions
 
     def _capture_queries(self, inputs: Mapping[str, Tensor]) -> Dict[int, Tensor]:
         """Un forward; q agregada por secuencia y capa, ya en CPU (float32)."""
