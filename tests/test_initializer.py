@@ -168,7 +168,7 @@ def test_ensure_utf8_stdio_reconfigures_legacy_code_pages(monkeypatch):
     from latentflow._console import ensure_utf8_stdio
 
     raw = io.BytesIO()
-    legacy = io.TextIOWrapper(raw, encoding="cp1252")
+    legacy = io.TextIOWrapper(raw, encoding="cp1252", newline="\n")  # sin \r\n en Windows
     monkeypatch.setattr(sys, "stdout", legacy)
     monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="utf-8"))
     ensure_utf8_stdio()
