@@ -227,7 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
     skop = parser.add_argument_group("SKOP")
     defaults = SKOPConfig()
     skop.add_argument("--layers", default=None, help="capas a calibrar, p. ej. '0-25' o '6,12' (por defecto todas)")
-    skop.add_argument("--tau-high", type=float, default=defaults.tau_high, help="umbral de atención del Focus Set")
+    skop.add_argument("--tau-high", type=float, default=defaults.tau_high,
+                      help="masa de atención que cubre el Focus Set de cada cabeza y paso (SKOP: 0.8)")
     skop.add_argument("--gamma", type=float, default=defaults.gamma_energy, help="energía retenida en U_ΔK")
     skop.add_argument("--risk-percentile", type=float, default=defaults.risk_percentile)
     skop.add_argument("--token-aggregation", choices=("last", "mean"), default=defaults.token_aggregation)
@@ -319,10 +320,10 @@ def run(args: argparse.Namespace, log=print) -> Path:
     finally:
         tmp.unlink(missing_ok=True)
 
-    ranks = [r for layer in summary["layers"].values() for r in layer["rank_per_kv_head"]]
+    ranks = [r for layer in summary["layers"].values() for r in layer["rank_per_head"]]
     risky = sum(len(layer["risky_heads"]) for layer in summary["layers"].values())
     log(
-        f"Σ_ΔK: {engine.num_delta_pairs:,} pares Focus × Tail de {engine.num_utility_samples} secuencias · "
+        f"Σ_ΔK: {engine.num_delta_steps:,} pasos (cabeza × query) con Focus y Tail de {engine.num_utility_samples} secuencias · "
         f"rango medio de U_ΔK {sum(ranks) / len(ranks):.1f}/{engine.geometry.head_dim} (γ={config.gamma_energy})"
     )
     log(f"r_q: {engine.num_concept_pairs} pares · cabezas de riesgo: {risky} (τ_R={summary['risk_threshold']:.4g})")

@@ -20,12 +20,20 @@ const SIGNAL = '#39f5b4'
 const THRESHOLD = '#fbbf24'
 const MARKER = '#a78bfa'
 const FONT = '10px "JetBrains Mono", ui-monospace, Menlo, monospace'
-const NICE_STEPS = [0.005, 0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.4, 0.5, 0.75, 1]
+/** Mantisas "redondas" de una década. */
+const NICE_MANTISSAS = [1, 2, 2.5, 4, 5, 7.5, 10]
+const MIN_Y = 0.005
 
-/** Menor tope "redondo" ≥ x (rango del eje Y; el cociente normalizado vive en [0, 1]). */
+/**
+ * Menor tope "redondo" ≥ x para el eje Y, en cualquier década: el cociente de
+ * Rayleigh absoluto (por defecto, como en SKOP) no está acotado; el normalizado
+ * por traza vive en [0, 1].
+ */
 export function niceCeil(x: number): number {
-  if (!Number.isFinite(x) || x <= 0) return NICE_STEPS[0]!
-  return NICE_STEPS.find((s) => s >= x) ?? 1
+  if (!Number.isFinite(x) || x <= MIN_Y) return MIN_Y
+  const decade = 10 ** Math.floor(Math.log10(x))
+  const mantissa = NICE_MANTISSAS.find((m) => m * decade >= x * (1 - 1e-12)) ?? 10
+  return Number((mantissa * decade).toPrecision(12))
 }
 
 /** Primera muestra visible: la ventana es la capacidad del anillo. */
@@ -104,7 +112,7 @@ export function drawScope(ctx: CanvasRenderingContext2D, buf: TelemetryBuffer, v
     ctx.fillText(m.label, x + 3, PAD.t + 2)
   }
 
-  // Umbral de riesgo (percentil de calibración, misma escala normalizada).
+  // Umbral de riesgo (percentil de calibración, en la misma escala que las trazas).
   if (buf.threshold !== null && buf.threshold <= yMax) {
     const y = Math.round(yOf(buf.threshold)) + 0.5
     ctx.strokeStyle = THRESHOLD
@@ -114,7 +122,7 @@ export function drawScope(ctx: CanvasRenderingContext2D, buf: TelemetryBuffer, v
     ctx.fillStyle = THRESHOLD
     ctx.textAlign = 'right'
     ctx.textBaseline = 'bottom'
-    ctx.fillText(`τ ${buf.threshold.toFixed(3)}`, PAD.l + plotW - 2, y - 2)
+    ctx.fillText(`τ ${fmt(buf.threshold)}`, PAD.l + plotW - 2, y - 2)
   }
   ctx.setLineDash([])
 
@@ -227,5 +235,13 @@ function line(ctx: CanvasRenderingContext2D, x0: number, y0: number, x1: number,
   ctx.stroke()
 }
 
-const fmt = (v: number) => (Number.isFinite(v) ? v.toFixed(3) : '—')
-const formatY = (v: number, yMax: number) => v.toFixed(yMax < 0.05 ? 3 : 2)
+/** Unas 3 cifras significativas en cualquier magnitud (el Rayleigh absoluto no está acotado). */
+export function fmt(v: number): string {
+  if (!Number.isFinite(v)) return '—'
+  const a = Math.abs(v)
+  if (a >= 100) return v.toFixed(0)
+  if (a >= 10) return v.toFixed(1)
+  if (a >= 1) return v.toFixed(2)
+  return a === 0 || a >= 0.001 ? v.toFixed(3) : v.toExponential(1)
+}
+const formatY = (v: number, yMax: number) => v.toFixed(Math.min(6, Math.max(0, 2 - Math.floor(Math.log10(yMax)))))

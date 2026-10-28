@@ -108,7 +108,8 @@ class DevModelSpec:
     intermediate_size: int = 256
     vocab_size: int = 100
     # Con la inicialización por defecto (0.02) la atención de un modelo aleatorio es
-    # casi uniforme y ninguna key supera tau_high: no habría pares Focus × Tail.
+    # casi uniforme y el Focus Set (0.8 de la masa) se lleva casi todas las keys;
+    # con 0.1 es más picuda, como la de un modelo entrenado.
     initializer_range: float = 0.1
     # Retardo por forward (s): simula la latencia de un modelo real para que el
     # streaming y los hot-swaps a mitad de generación sean observables en la UI.

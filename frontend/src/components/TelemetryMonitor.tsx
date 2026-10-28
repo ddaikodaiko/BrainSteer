@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { cx } from '../lib/cx'
 import { drawScope, type ScopeScale, type ScopeView } from '../lib/scopeRenderer'
 import { telemetryBuffer, type TelemetryBuffer } from '../lib/telemetryBuffer'
+import { useCircuitStore } from '../store/useCircuitStore'
 
 interface TelemetryMonitorProps {
   buffer?: TelemetryBuffer
@@ -9,7 +10,8 @@ interface TelemetryMonitorProps {
 }
 
 /**
- * Osciloscopio del cociente de Rayleigh normalizado de las cabezas de riesgo.
+ * Osciloscopio del cociente de Rayleigh de las cabezas de riesgo: la energía
+ * absoluta de SKOP por defecto, o la normalizada por traza si el servidor la usa.
  *
  * Canvas 2D puro: un bucle `requestAnimationFrame` compara `buffer.version` y
  * sólo redibuja si llegó un token nuevo (o cambió el tamaño/las opciones). Los
@@ -19,7 +21,10 @@ interface TelemetryMonitorProps {
 export function TelemetryMonitor({ buffer = telemetryBuffer, className }: TelemetryMonitorProps) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [scale, setScale] = useState<ScopeScale>('auto')
+  const normalized = useCircuitStore((s) => s.serverCircuit?.normalize_rayleigh ?? false)
+  const [unitScale, setUnitScale] = useState(false)
+  // [0, 1] sólo tiene sentido con Σ/tr(Σ); la energía absoluta no está acotada.
+  const scale: ScopeScale = normalized && unitScale ? 'unit' : 'auto'
   const [showMean, setShowMean] = useState(true)
   const [showBaseline, setShowBaseline] = useState(true)
   const optionsRef = useRef({ scale, showMean, showBaseline, dirty: true })
@@ -74,11 +79,15 @@ export function TelemetryMonitor({ buffer = telemetryBuffer, className }: Teleme
       <header className="flex flex-wrap items-center gap-2 border-b border-ink-700/80 px-4 py-2.5">
         <span className="size-1.5 rounded-full bg-signal shadow-[0_0_8px_var(--color-signal)]" />
         <h2 className="text-[13px] font-semibold text-ink-100">Osciloscopio de riesgo</h2>
-        <span className="font-mono text-[10.5px] text-ink-400">R̂(q) = qᵀΣ̂q / qᵀq · Σ̂ = Σ/tr(Σ)</span>
+        <span className="font-mono text-[10.5px] text-ink-400">
+          {normalized ? 'R̂(q) = qᵀΣ̂q / qᵀq · Σ̂ = Σ/tr(Σ)' : 'R(q) = qᵀΣq / (‖q‖² + ε)'}
+        </span>
         <div className="ml-auto flex items-center gap-1">
-          <Chip active={scale === 'auto'} onClick={() => setScale(scale === 'auto' ? 'unit' : 'auto')}>
-            {scale === 'auto' ? 'Y auto' : 'Y [0,1]'}
-          </Chip>
+          {normalized && (
+            <Chip active={scale === 'auto'} onClick={() => setUnitScale(!unitScale)}>
+              {scale === 'auto' ? 'Y auto' : 'Y [0,1]'}
+            </Chip>
+          )}
           <Chip active={showMean} onClick={() => setShowMean(!showMean)}>
             media
           </Chip>
@@ -92,7 +101,7 @@ export function TelemetryMonitor({ buffer = telemetryBuffer, className }: Teleme
           ref={canvasRef}
           className="absolute inset-0"
           role="img"
-          aria-label="Osciloscopio del cociente de Rayleigh normalizado por token de las cabezas de riesgo"
+          aria-label="Osciloscopio del cociente de Rayleigh por token de las cabezas de riesgo"
         />
       </div>
       <footer className="flex flex-wrap gap-x-4 gap-y-1 border-t border-ink-700/80 px-4 py-2 font-mono text-[10px] text-ink-400">

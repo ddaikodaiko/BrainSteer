@@ -19,9 +19,9 @@ export interface ScopeMarker {
 }
 
 /**
- * Historia token a token del cociente de Rayleigh normalizado de las cabezas de
- * riesgo. Vive fuera de React: el WebSocket escribe y el osciloscopio lee en su
- * bucle `requestAnimationFrame`, comparando `version` para redibujar sólo si hay
+ * Historia token a token del cociente de Rayleigh de las cabezas de riesgo.
+ * Vive fuera de React: el WebSocket escribe y el osciloscopio lee en su bucle
+ * `requestAnimationFrame`, comparando `version` para redibujar sólo si hay
  * datos nuevos. Ninguna llegada de token provoca un render de React.
  */
 export class TelemetryBuffer {

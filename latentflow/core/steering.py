@@ -3,19 +3,21 @@ latentflow.core.steering
 ========================
 
 Núcleo matemático de BrainSteer: steering de queries con proyección ortogonal
-al subespacio de diferencias de keys (SKOP).
+al subespacio de diferencias de keys (SKOP; Luo, Espinosa Zarlenga y Jamnik,
+arXiv:2605.06342, Algoritmo 1).
 
 Pipeline
 --------
 1. Calibración offline con el modelo base, sin steering (``SKOPEngine.calibrate``).
 
    a) Geometría de keys sobre un *utility set* genérico (``accumulate_utility_batch``).
-      Para cada cabeza de atención, cada query ``t`` y su distribución de atención
-      real ``a_t``, se separan las keys atendibles en un *Focus Set*
-      ``F_t = {s : a_t[s] > tau_high}`` y un *Tail Set* ``T_t`` (el complemento).
-      En CPU/float64 se acumula el segundo momento sobre todos los pares::
+      Para cada cabeza de atención, cada paso (query) ``t`` y su distribución de
+      atención real ``a_t``, el *Focus Set* ``F_t`` es el conjunto mínimo de keys
+      que acumula al menos ``tau_high`` (0.8) de la masa, y el *Tail Set* ``T_t``
+      el resto de keys atendibles. En CPU/float64 se acumula el segundo momento,
+      con cada paso promediado sobre sus pares y los pasos con el mismo peso::
 
-          Sigma_ΔK = E[Δk Δkᵀ],   Δk = k_i − k_j,   i ∈ F_t,  j ∈ T_t     (por cabeza KV)
+          Sigma_ΔK = E_t E_{(i,j) ~ U(F_t × T_t)}[Δk Δkᵀ],   Δk = k_i − k_j   (por cabeza)
 
       No intervienen prompts contrastivos: Σ_ΔK describe la geometría con la que el
       modelo base separa los tokens que atiende de los que no.
@@ -38,9 +40,11 @@ Pipeline
    energía acumulada alcanza ``gamma_energy`` y ``P_ΔK = I − U_k U_kᵀ``.
 
 3. Filtrado por cociente de Rayleigh (``SKOPEngine.compute_risk``)
-   ``R_h = r_hᵀ Σ̂ r_h / r_hᵀ r_h`` con ``Σ̂ = Σ / tr(Σ)``. Las cabezas por encima
-   del percentil ``risk_percentile`` (top 20 % por defecto, global sobre todas las
-   capas) reciben ``q' = q + α P_ΔK r_q``; el resto, ``q' = q + α r_q``.
+   ``R_h = r_hᵀ Σ r_h / (‖r_h‖² + ε)``: la energía absoluta de la perturbación del
+   gap Focus/Tail por unidad de norma (``normalize_rayleigh=True`` usa
+   ``Σ / tr(Σ)``, opcional). Las cabezas por encima del percentil
+   ``risk_percentile`` (top 20 % por defecto, global sobre todas las capas) reciben
+   ``q' = q + α P_ΔK r_q``; el resto, ``q' = q + α r_q``.
 
 Por qué funciona: ``q'·Δk = q·Δk + α (P_ΔK r_q)·Δk``. Como ``P_ΔK`` anula el
 subespacio donde se concentra Δk, el steering apenas cambia la diferencia de score
@@ -57,7 +61,11 @@ Notas:
   definen Focus/Tail son las reales del modelo (post-RoPE, con soft-capping y
   ventana deslizante en Gemma-2), por lo que la calibración de Σ_ΔK requiere
   ``attn_implementation="eager"`` (SDPA/Flash no exponen los pesos).
-- Interpretación: ``tau_high`` se aplica a la probabilidad de atención query→key.
+- RoPE: Σ_ΔK se estima con keys previas a RoPE y el steering se suma a la query
+  previa a RoPE. En el score real, la perturbación de la query ``t`` frente a la
+  key ``i`` es ``δq · R_{i−t} k_i`` (``R`` = rotación relativa), así que ``P_ΔK``
+  protege exactamente sólo donde esa rotación es pequeña (las frecuencias bajas
+  de RoPE); en las altas, la protección es aproximada.
 
 Uso
 ---
@@ -85,6 +93,7 @@ __all__ = [
     "SKOPConfig",
     "SKOPEngine",
     "compute_orthogonal_projector",
+    "focus_set_mask",
     "focus_tail_second_moment",
     "load_quantized_model",
     "rayleigh_quotient",
@@ -94,8 +103,9 @@ __all__ = [
 
 DEFAULT_MODEL_ID = "google/gemma-2-2b-it"
 
-#: Formato del artefacto de ``SKOPEngine.save()``. v2: Σ_ΔK por Focus/Tail.
-ARTIFACT_FORMAT = "latentflow.skop/v2"
+#: Formato del artefacto de ``SKOPEngine.save()``. v3: Focus Set por masa acumulada,
+#: media por pasos y Σ_ΔK por cabeza de query (v2 no se puede convertir: recalibra).
+ARTIFACT_FORMAT = "latentflow.skop/v3"
 
 TokenAggregation = Literal["last", "mean"]
 
@@ -125,16 +135,17 @@ class SKOPConfig:
             cabeza se considera de riesgo (0.80 -> top 20 %).
         alpha: intensidad del steering.
         layers: índices de capa a intervenir (``None`` = todas).
-        tau_high: umbral de probabilidad de atención que separa el Focus Set
-            (``a > tau_high``) del Tail Set al estimar Σ_ΔK.
+        tau_high: masa de atención del Focus Set: para cada cabeza y paso, el
+            conjunto mínimo de keys que acumula al menos esa fracción (0.8 en SKOP).
+            El resto de keys atendibles forma el Tail Set.
         token_aggregation: cómo resumir cada prompt de concepto en un vector para
             ``r_q`` (``"last"``: último token no-pad; ``"mean"``: media enmascarada).
         batch_size: secuencias (o pares de concepto) por forward en calibración.
         max_length: truncado de tokenización en calibración.
         normalize_steering: si True, ``r_q`` se normaliza a norma 1 por cabeza.
-        normalize_rayleigh: si True, el cociente de Rayleigh se evalúa sobre
-            ``Σ / (tr(Σ) + rayleigh_eps)`` para que el ranking global de riesgo no
-            se sesgue hacia las capas con mayor escala de activación.
+        normalize_rayleigh: si True (opcional, desactivado como en SKOP), el
+            cociente de Rayleigh se evalúa sobre ``Σ / (tr(Σ) + rayleigh_eps)``, de
+            modo que el ranking global no favorece a las capas de mayor escala.
         rayleigh_eps: estabilizador de la normalización por traza.
         eps: estabilizador numérico.
     """
@@ -143,12 +154,12 @@ class SKOPConfig:
     risk_percentile: float = 0.80
     alpha: float = 1.0
     layers: Optional[Sequence[int]] = None
-    tau_high: float = 0.1
+    tau_high: float = 0.8
     token_aggregation: TokenAggregation = "last"
     batch_size: int = 4
     max_length: int = 256
     normalize_steering: bool = False
-    normalize_rayleigh: bool = True
+    normalize_rayleigh: bool = False
     rayleigh_eps: float = 1e-6
     eps: float = 1e-12
 
@@ -317,11 +328,11 @@ def compute_orthogonal_projector(
 
 @torch.no_grad()
 def rayleigh_quotient(sigma: Tensor, r: Tensor, eps: float = 1e-12) -> Tensor:
-    """``R(r) = r^T Σ r / r^T r``. sigma (..., d, d), r (..., d) -> (...)."""
+    """``R(r) = rᵀ Σ r / (‖r‖² + ε)`` (Ec. 16 de SKOP). sigma (..., d, d), r (..., d) -> (...)."""
     s = sigma.detach().to(device="cpu", dtype=_MATH_DTYPE)
     v = r.detach().to(device="cpu", dtype=_MATH_DTYPE)
     numerator = torch.einsum("...i,...ij,...j->...", v, s, v)
-    return numerator / (v * v).sum(-1).clamp_min(eps)
+    return numerator / ((v * v).sum(-1) + eps)
 
 
 @torch.no_grad()
@@ -345,6 +356,32 @@ def select_risky_heads(scores: Tensor, percentile: float = 0.80) -> Tuple[Tensor
     return scores.cpu() > threshold, threshold
 
 
+#: Tolerancia al comparar la masa acumulada con ``tau_high`` (probabilidades en float32).
+_MASS_TOL = 1e-6
+
+
+@torch.no_grad()
+def focus_set_mask(probs: Tensor, attendable: Tensor, tau_high: float) -> Tensor:
+    """Focus Set de cada (cabeza, paso): el conjunto mínimo de keys cuya masa de
+    atención acumulada alcanza ``tau_high`` (Algoritmo 1 de SKOP).
+
+    Args:
+        probs: probabilidades de atención, (..., T_q, T_k).
+        attendable: máscara booleana de las keys atendibles, misma forma.
+        tau_high: fracción de masa del Focus Set, en (0, 1).
+
+    Las keys se ordenan por probabilidad descendente (orden estable ante empates)
+    y entra cada una mientras la masa de las anteriores sea < ``tau_high``. La
+    masa se mide sobre las keys atendibles de la fila.
+    """
+    p = torch.where(attendable, probs.float(), 0.0)
+    p = p / p.sum(-1, keepdim=True).clamp_min(torch.finfo(p.dtype).tiny)
+    sorted_p, order = p.sort(dim=-1, descending=True, stable=True)
+    mass_before = sorted_p.double().cumsum(-1) - sorted_p.double()
+    chosen = (mass_before < tau_high - _MASS_TOL) & (sorted_p > 0)
+    return torch.zeros_like(attendable).scatter(-1, order, chosen)
+
+
 @torch.no_grad()
 def focus_tail_second_moment(
     keys: Tensor,
@@ -353,50 +390,55 @@ def focus_tail_second_moment(
     tau_high: float,
     num_kv_heads: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Suma de ``Δk Δkᵀ`` sobre todos los pares Focus × Tail de un lote.
+    """Suma, sobre los pasos de un lote, de la media de ``Δk Δkᵀ`` en ``F_t × T_t``.
 
     Args:
         keys: salida de ``k_proj``, (B, T, H_kv·d).
         attention: probabilidades de atención del modelo base, (B, H, T, T)
             (fila = query, columna = key).
         attention_mask: (B, T); las queries y keys de padding se excluyen.
-        tau_high: una key pertenece al Focus Set de la query ``t`` si ``a_t[s] > tau_high``.
-        num_kv_heads: con GQA, cada cabeza KV agrega las queries de su grupo.
+        tau_high: masa de atención del Focus Set (``focus_set_mask``).
+        num_kv_heads: con GQA, cada cabeza de query usa las keys de su grupo.
 
     Returns:
-        ``(sums, pairs)`` en CPU/float64: ``sums`` (H_kv, d, d) y ``pairs`` (H_kv,).
+        ``(sums, steps)`` en CPU/float64, por cabeza de **query**: ``sums`` (H, d, d)
+        y ``steps`` (H,), el número de pasos con Focus y Tail no vacíos.
+        ``sums / steps`` es ``Σ_ΔK = E_t E_{(i,j) ~ U(F_t × T_t)}[Δk Δkᵀ]``.
 
-    Para cada query, ``Σ_{i∈F, j∈T} (k_i − k_j)(k_i − k_j)ᵀ`` se factoriza de forma
-    exacta como ``Kᵀ G K`` con ``G = diag(w) − C − Cᵀ`` (T×T), donde
-    ``w_s = Σ_t F[t,s]·|T_t| + T[t,s]·|F_t|`` y ``C = Fᵀ T``. Así el coste es
-    O(T³ + T²·d + T·d²) por cabeza (``C``, ``G K`` y ``Kᵀ (G K)``) en vez de
-    O(P·d²) al enumerar los P pares (hasta O(T³·d²)). Las keys con
-    probabilidad 0 (futuras, padding o fuera de la ventana deslizante) no son
-    atendibles y no entran en ningún conjunto.
+    Cada paso (cabeza, query ``t``) pesa lo mismo: sus pares se promedian con
+    ``c_t = 1 / (|F_t|·|T_t|)``. La suma ponderada se factoriza de forma exacta como
+    ``Kᵀ G K`` con ``G = diag(w) − C − Cᵀ`` (T×T), donde
+    ``w_s = Σ_t c_t (F[t,s]·|T_t| + T[t,s]·|F_t|) = Σ_t F[t,s]/|F_t| + T[t,s]/|T_t|``
+    y ``C = Fᵀ diag(c) T``. Así el coste es O(T³ + T²·d + T·d²) por cabeza
+    (``C``, ``G K`` y ``Kᵀ (G K)``) en vez de O(P·d²) al enumerar los P pares
+    (hasta O(T³·d²)). Las keys con probabilidad 0 (futuras, padding o fuera de la
+    ventana deslizante) no son atendibles y no entran en ningún conjunto.
     """
     batch, num_heads, seq_len, _ = attention.shape
     group = num_heads // num_kv_heads
     head_dim = keys.shape[-1] // num_kv_heads
     device = attention.device
 
-    probs = attention.float()
     valid_tok = attention_mask.to(device).bool()
-    valid = (probs > 0) & valid_tok[:, None, :, None] & valid_tok[:, None, None, :]
-    focus = (valid & (probs > tau_high)).float()
-    tail = valid.float() - focus
+    attendable = (attention > 0) & valid_tok[:, None, :, None] & valid_tok[:, None, None, :]
+    focus_mask = focus_set_mask(attention, attendable, tau_high)
+    focus = focus_mask.float()
+    tail = (attendable & ~focus_mask).float()
     n_focus = focus.sum(-1)  # (B, H, T)
     n_tail = tail.sum(-1)
+    step = (n_focus > 0) & (n_tail > 0)
+    weight = step.float() / (n_focus * n_tail).clamp_min(1.0)  # c_t
 
-    weights = torch.einsum("bhts,bht->bhs", focus, n_tail) + torch.einsum("bhts,bht->bhs", tail, n_focus)
-    cross = torch.einsum("bhts,bhtu->bhsu", focus, tail)
-    gram = torch.diag_embed(weights) - cross - cross.mT
-    gram = gram.view(batch, num_kv_heads, group, seq_len, seq_len).sum(2)  # (B, H_kv, T, T)
+    w = torch.einsum("bhts,bht->bhs", focus, weight * n_tail) + torch.einsum("bhts,bht->bhs", tail, weight * n_focus)
+    cross = torch.einsum("bhts,bht,bhtu->bhsu", focus, weight, tail)
+    gram = torch.diag_embed(w) - cross - cross.mT  # (B, H, T, T)
 
     k = keys.to(device).float().view(batch, seq_len, num_kv_heads, head_dim).transpose(1, 2)  # (B, H_kv, T, d)
-    kg = torch.einsum("bgtd,bgts->bgds", k, gram)
-    sums = torch.einsum("bgds,bgse->gde", kg, k)
-    pairs = (n_focus * n_tail).view(batch, num_kv_heads, group, seq_len).sum((0, 2, 3))
-    return sums.to(device="cpu", dtype=_MATH_DTYPE), pairs.to(device="cpu", dtype=_MATH_DTYPE)
+    k = k.repeat_interleave(group, dim=1)  # (B, H, T, d): keys del grupo de cada query
+    kg = torch.einsum("bhtd,bhts->bhds", k, gram)
+    sums = torch.einsum("bhds,bhse->hde", kg, k)
+    steps = step.sum((0, 2))
+    return sums.to(device="cpu", dtype=_MATH_DTYPE), steps.to(device="cpu", dtype=_MATH_DTYPE)
 
 
 def _aggregate_tokens(
@@ -473,20 +515,20 @@ class SKOPEngine:
         layers = range(n_layers) if self.config.layers is None else self.config.layers
         self.layer_ids: List[int] = _check_layer_ids(layers, n_layers)
 
-        self.sigma_delta_k: Dict[int, Tensor] = {}      # (H_kv, d, d)
+        self.sigma_delta_k: Dict[int, Tensor] = {}      # (H, d, d), por cabeza de query
         self.steering_vectors: Dict[int, Tensor] = {}   # r_q, (H, d)
         self.projectors: Dict[int, ProjectorResult] = {}
         self.rayleigh: Dict[int, Tensor] = {}           # (H,)
         self.risk_mask: Dict[int, Tensor] = {}          # (H,) bool
         self.risk_threshold: Optional[float] = None
         self.num_utility_samples = 0   # secuencias del utility set
-        self.num_delta_pairs = 0       # pares (query, i∈Focus, j∈Tail) en Σ_ΔK
+        self.num_delta_steps = 0       # pasos (cabeza, query) con Focus y Tail no vacíos
         self.num_concept_pairs = 0     # pares contrastivos usados para r_q
 
         self._sigma_acc: Dict[int, SecondMomentAccumulator] = {}
         self._rq_acc: Dict[int, _MeanAccumulator] = {}
         self._effective: Dict[int, Tensor] = {}         # (H*d,) float64, sin α
-        self._risk_sigma: Dict[int, Tensor] = {}        # Σ usada en Rayleigh, por cabeza de query (H, d, d)
+        self._risk_sigma: Dict[int, Tensor] = {}        # Σ usada en Rayleigh (H, d, d)
         self._cast_cache: Dict[Tuple[int, torch.device, torch.dtype], Tensor] = {}
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
         self._telemetry_handles: List[torch.utils.hooks.RemovableHandle] = []
@@ -571,11 +613,21 @@ class SKOPEngine:
     def residual_to_query(self, layer: int, direction: Tensor) -> Tensor:
         """Mapea una dirección del residual stream al espacio de queries de ``layer``.
 
-        ``r_q = q_proj(input_layernorm(v))``: es el cambio de la query cuando el
-        residual que entra al bloque apunta en la dirección ``v`` (p. ej. el decoder
-        de una feature de un SAE residual). La dirección es exacta; la escala absoluta
-        depende de la norma RMS de cada token, que aquí se fija con ``|v|``. Llama a
-        ``.forward`` de los módulos para no disparar los hooks de steering/telemetría.
+        ``r_q = q_proj(input_layernorm(v))`` (p. ej. ``v`` = decoder de una feature de
+        un SAE residual) es una **aproximación** del cambio de la query cuando se
+        empuja el residual ``h`` de un token en la dirección ``v``:
+
+        - RMSNorm se linealiza en ``v`` y no en ``h``. Su Jacobiano real,
+          ``J(h) v ∝ g ⊙ (v − h (h·v) / ‖h‖²) / rms(h)``, depende del token: la
+          dirección coincide sólo si ``v ⊥ h``, y se desvía más cuanto más se alinea
+          ``v`` con el residual (justo el caso de una feature activa). La escala
+          tampoco es la real: aquí la fija ``|v|``, en el modelo ``rms(h)``.
+        - El vector vive en el espacio de queries **previo a RoPE**. RoPE lo rota con
+          la posición de cada query, de modo que su efecto en el score con la key
+          ``i`` depende del desfase ``i − t`` (ver la nota sobre RoPE del módulo).
+
+        Llama a ``.forward`` de los módulos para no disparar los hooks de
+        steering/telemetría.
 
         Returns: (H, d) en float64/CPU.
         """
@@ -652,7 +704,7 @@ class SKOPEngine:
     # ----------------------------------------------------------- calibración
     def reset_calibration(self) -> None:
         g = self.geometry
-        self._sigma_acc = {l: SecondMomentAccumulator(g.num_kv_heads, g.head_dim) for l in self.layer_ids}
+        self._sigma_acc = {l: SecondMomentAccumulator(g.num_heads, g.head_dim) for l in self.layer_ids}
         self._rq_acc = {l: _MeanAccumulator(g.num_heads, g.head_dim) for l in self.layer_ids}
         self._utility_seen = 0
 
@@ -708,8 +760,8 @@ class SKOPEngine:
         """Acumula Σ_ΔK (Focus/Tail) de un lote tokenizado del utility set.
 
         Por capa, el hook de ``k_proj`` guarda las keys en el device y el hook del
-        módulo de atención, con los pesos reales, reduce los pares Focus × Tail a
-        una matriz (H_kv, d, d) que baja a CPU. Nunca hay más de una capa de keys y
+        módulo de atención, con los pesos reales, reduce los pasos Focus × Tail a
+        una matriz (H, d, d) que baja a CPU. Nunca hay más de una capa de keys y
         atención en memoria a la vez.
         """
         input_ids, mask = self._prepare(inputs)
@@ -747,8 +799,8 @@ class SKOPEngine:
         if missing:
             raise RuntimeError(f"No se capturó la atención en las capas {missing}")
         # Se aplica sólo si todas las capas tuvieron éxito: el lote entra entero o no entra.
-        for l, (sums, pairs) in results.items():
-            self._sigma_acc[l].add(sums, pairs)
+        for l, (sums, steps) in results.items():
+            self._sigma_acc[l].add(sums, steps)
         self._utility_seen += int(input_ids.shape[0])
 
     @torch.no_grad()
@@ -810,13 +862,13 @@ class SKOPEngine:
         first = self.layer_ids[0]
         if self._sigma_acc[first].total == 0:
             raise RuntimeError(
-                "Σ_ΔK sin pares Focus × Tail: añade muestras de utilidad (o revisa tau_high: "
-                "con atención casi uniforme ninguna key lo supera)"
+                "Σ_ΔK sin pasos con Focus y Tail no vacíos: añade textos de utilidad más largos "
+                "(o baja tau_high: si el Focus Set necesita todas las keys, el Tail queda vacío)"
             )
         for l in self.layer_ids:
             self.sigma_delta_k[l] = self._sigma_acc[l].finalize()
         self.num_utility_samples = self._utility_seen
-        self.num_delta_pairs = sum(self._sigma_acc[l].total for l in self.layer_ids)
+        self.num_delta_steps = sum(self._sigma_acc[l].total for l in self.layer_ids)
         if self._rq_acc[first].count > 0:
             for l in self.layer_ids:
                 r = self._rq_acc[l].finalize()
@@ -870,13 +922,11 @@ class SKOPEngine:
         """Cociente de Rayleigh por cabeza de query y máscara global top-(1-p)."""
         if not self.projectors or not (self.steering_vectors or self._direction_override):
             raise RuntimeError("Faltan proyectores o vectores de steering")
-        kv_idx = self.geometry.kv_index()
         for l in self.layer_ids:
             sigma = self.sigma_delta_k[l]
             if self.config.normalize_rayleigh:
                 sigma = trace_normalize(sigma, self.config.rayleigh_eps)
-            # GQA: cada cabeza de query se evalúa con la Σ de su grupo KV.
-            self._risk_sigma[l] = sigma[kv_idx]
+            self._risk_sigma[l] = sigma
             self.rayleigh[l] = rayleigh_quotient(self._risk_sigma[l], self.direction_for(l), self.config.eps)
         scores = torch.stack([self.rayleigh[l] for l in self.layer_ids])  # (L, H)
         mask, self.risk_threshold = select_risky_heads(scores, self.config.risk_percentile)
@@ -886,10 +936,9 @@ class SKOPEngine:
         return self
 
     def _build_effective_vectors(self) -> None:
-        kv_idx = self.geometry.kv_index()
         for l in self.layer_ids:
             r = self.direction_for(l)
-            projected = torch.einsum("hij,hj->hi", self.projectors[l].projector[kv_idx], r)
+            projected = torch.einsum("hij,hj->hi", self.projectors[l].projector, r)
             use_projection = self.risk_mask[l] & self.projection_for(l)
             effective = torch.where(use_projection.unsqueeze(-1), projected, r)
             self._effective[l] = effective.reshape(-1).contiguous()
@@ -992,7 +1041,7 @@ class SKOPEngine:
     def summary(self) -> Dict[str, Any]:
         return {
             "num_utility_samples": self.num_utility_samples,
-            "num_delta_pairs": self.num_delta_pairs,
+            "num_delta_steps": self.num_delta_steps,
             "num_concept_pairs": self.num_concept_pairs,
             "tau_high": self.config.tau_high,
             "gamma_energy": self.config.gamma_energy,
@@ -1004,7 +1053,7 @@ class SKOPEngine:
             "layer_plan": self.layer_plan,
             "layers": {
                 l: {
-                    "rank_per_kv_head": self.projectors[l].rank.tolist(),
+                    "rank_per_head": self.projectors[l].rank.tolist(),
                     "rayleigh": self.rayleigh[l].tolist(),
                     "risky_heads": self.risk_mask[l].nonzero().flatten().tolist(),
                 }
@@ -1022,7 +1071,7 @@ class SKOPEngine:
             "geometry": vars(self.geometry).copy(),
             "tau_high": self.config.tau_high,
             "num_utility_samples": self.num_utility_samples,
-            "num_delta_pairs": self.num_delta_pairs,
+            "num_delta_steps": self.num_delta_steps,
             "num_concept_pairs": self.num_concept_pairs,
             "sigma_delta_k": dict(self.sigma_delta_k),
             "steering_vectors": dict(self.steering_vectors),
@@ -1053,7 +1102,7 @@ class SKOPEngine:
         self.sigma_delta_k = {l: sigma[l].to(_MATH_DTYPE) for l in layers}
         self.steering_vectors = {l: vectors[l].to(_MATH_DTYPE) for l in layers if l in vectors}
         self.num_utility_samples = int(state["num_utility_samples"])
-        self.num_delta_pairs = int(state["num_delta_pairs"])
+        self.num_delta_steps = int(state["num_delta_steps"])
         self.num_concept_pairs = int(state["num_concept_pairs"])
         self.metadata = dict(state.get("meta", {}))
         if fit:

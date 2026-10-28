@@ -210,9 +210,11 @@ respuesta muestra tokens, tok/s y motivo de fin.
 
 ## `TelemetryMonitor`: osciloscopio en canvas
 
-El osciloscopio dibuja, token a token, el cociente de Rayleigh normalizado
-`R̂(q) = qᵀΣ̂q / qᵀq` de cada cabeza de riesgo. Está diseñado para que **el
-streaming no provoque ningún render de React**.
+El osciloscopio dibuja, token a token, el cociente de Rayleigh
+`R(q) = qᵀΣq / (‖q‖² + ε)` de cada cabeza de riesgo: la energía absoluta de SKOP,
+sin cota superior fija. Si el servidor usa `normalize_rayleigh`, dibuja
+`R̂(q) = qᵀΣ̂q / qᵀq` con `Σ̂ = Σ/tr(Σ)`, en [0, 1], y la cabecera lo indica. Está
+diseñado para que **el streaming no provoque ningún render de React**.
 
 **1. Los datos viven fuera de React.**
 [`telemetryBuffer`](src/lib/telemetryBuffer.ts) es un singleton con anillos de
@@ -235,7 +237,9 @@ monta un bucle rAF una sola vez. En cada frame compara `buffer.version` con la
 librerías de gráficas:
 
 - **Retícula:** 10 × 5 divisiones.
-- **Eje Y:** autoescalado a un tope "redondo", o fijo a [0, 1].
+- **Eje Y:** autoescalado a un tope "redondo" de cualquier década (1, 2, 2.5, 4,
+  5 o 7.5 × 10ⁿ); con `normalize_rayleigh`, también puede fijarse a [0, 1]. Las
+  etiquetas usan unas tres cifras significativas.
 - **Umbral:** el de riesgo τ, en ámbar.
 - **Marcadores de hot-swap:** en violeta.
 - **Una traza por cabeza:**

@@ -126,9 +126,10 @@ def test_generate_streams_tokens_with_risk_telemetry(client):
     for t in tokens:
         tel = t["telemetry"]
         assert tel["available"] is True
-        assert 0.0 <= tel["summary"]["mean"] <= tel["summary"]["max"] <= 1.0
+        # Energía absoluta de Rayleigh (SKOP): no negativa, sin cota superior fija.
+        assert 0.0 <= tel["summary"]["mean"] <= tel["summary"]["max"]
         assert {(h["layer"], h["head"]) for h in tel["heads"]} == risky
-        assert all(h["projected"] and h["risky"] and 0.0 <= h["rayleigh"] <= 1.0 for h in tel["heads"])
+        assert all(h["projected"] and h["risky"] and h["rayleigh"] >= 0.0 for h in tel["heads"])
 
     end = msgs[-1]
     assert end["reason"] == "length" and end["num_tokens"] == 6
@@ -305,7 +306,7 @@ def test_uncalibrated_runtime_streams_without_telemetry_and_can_calibrate():
             msgs = recv_until(ws, lambda m: m["type"] in ("calibrated", "error"))
             assert msgs[-1]["type"] == "calibrated", msgs[-1]
             assert msgs[-1]["circuit"]["calibrated"] is True
-            assert (engine.num_concept_pairs, engine.num_utility_samples) == (2, 2) and engine.num_delta_pairs > 0
+            assert (engine.num_concept_pairs, engine.num_utility_samples) == (2, 2) and engine.num_delta_steps > 0
             ws.send_json({"action": "update", "steering": True})
             circuit = recv_until(ws, lambda m: m["type"] == "circuit" and "steering" in m["changes"])[-1]
             assert circuit["circuit"]["steering"] is True and engine.is_attached

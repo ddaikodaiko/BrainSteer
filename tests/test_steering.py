@@ -11,6 +11,7 @@ from latentflow.core.steering import (
     SKOPEngine,
     _aggregate_tokens,
     compute_orthogonal_projector,
+    focus_set_mask,
     focus_tail_second_moment,
     rayleigh_quotient,
     select_risky_heads,
@@ -276,10 +277,10 @@ def test_engine_shapes_and_cpu_statistics(calibrated_engine):
     e = calibrated_engine
     assert e.num_concept_pairs == 24
     assert e.num_utility_samples == 12
-    assert e.num_delta_pairs > 0
+    assert e.num_delta_steps > 0
     for l in e.layer_ids:
         sigma = e.sigma_delta_k[l]
-        assert sigma.shape == (N_KV, HEAD_DIM, HEAD_DIM)
+        assert sigma.shape == (N_HEADS, HEAD_DIM, HEAD_DIM)  # por cabeza de query
         assert sigma.device.type == "cpu" and sigma.dtype == F64
         P = e.projectors[l].projector
         assert torch.equal(P, P.mT)
@@ -291,16 +292,15 @@ def test_engine_shapes_and_cpu_statistics(calibrated_engine):
 
 def test_effective_vectors_follow_rayleigh_filter(calibrated_engine):
     e = calibrated_engine
-    kv_idx = e.geometry.kv_index()
     for l, v in e.effective_vectors().items():
         r = e.steering_vectors[l]
         for h in range(N_HEADS):
             res = e.projectors[l]
-            U = res.retained_basis()[kv_idx[h]]
+            U = res.retained_basis()[h]
             if e.risk_mask[l][h]:
                 # Cabeza de riesgo: el steering no tiene componente en el subespacio ΔK.
                 torch.testing.assert_close(U.mT @ v[h], torch.zeros(HEAD_DIM, dtype=F64), rtol=0, atol=1e-10)
-                torch.testing.assert_close(v[h], e.alpha * res.projector[kv_idx[h]] @ r[h])
+                torch.testing.assert_close(v[h], e.alpha * res.projector[h] @ r[h])
             else:
                 torch.testing.assert_close(v[h], e.alpha * r[h])
 
@@ -367,8 +367,8 @@ def test_calibrate_with_tokenizer_and_save_load_roundtrip(tmp_path):
     assert state["format"] == ARTIFACT_FORMAT and state["tau_high"] == engine.config.tau_high
     other = SKOPEngine(model, SKOPConfig(batch_size=2)).load(str(path))
     assert other.metadata == {"model_id": "tiny"}
-    assert (other.num_utility_samples, other.num_delta_pairs, other.num_concept_pairs) == (
-        engine.num_utility_samples, engine.num_delta_pairs, engine.num_concept_pairs)
+    assert (other.num_utility_samples, other.num_delta_steps, other.num_concept_pairs) == (
+        engine.num_utility_samples, engine.num_delta_steps, engine.num_concept_pairs)
     for l in engine.layer_ids:
         torch.testing.assert_close(other.sigma_delta_k[l], engine.sigma_delta_k[l])
         torch.testing.assert_close(other.steering_vectors[l], engine.steering_vectors[l])
@@ -417,7 +417,8 @@ def _scaled_layer_risk(engine, layer, scale):
 
 def test_risk_ranking_is_invariant_to_per_layer_scale_when_normalized(calibrated_engine):
     e = calibrated_engine
-    assert e.config.normalize_rayleigh
+    e.config.normalize_rayleigh = True  # opcional: SKOP usa la energía absoluta
+    e.fit()
     before = {l: m.clone() for l, m in e.risk_mask.items()}
     before_scores = torch.stack([e.rayleigh[l] for l in e.layer_ids])
     after = _scaled_layer_risk(e, layer=2, scale=1e4)  # simula una capa profunda de gran escala
@@ -431,7 +432,7 @@ def test_risk_ranking_is_invariant_to_per_layer_scale_when_normalized(calibrated
 
 def test_unnormalized_ranking_is_biased_towards_large_scale_layer(calibrated_engine):
     e = calibrated_engine
-    e.config.normalize_rayleigh = False
+    assert not e.config.normalize_rayleigh  # por defecto, como en el paper
     after = _scaled_layer_risk(e, layer=2, scale=1e4)
     risky_layers = {l for l, m in after.items() if m.any()}
     assert risky_layers == {2}, "sin normalizar, el top 20 % se concentra en la capa de mayor escala"
@@ -467,7 +468,7 @@ def test_live_telemetry_sees_steered_query_regardless_of_hook_order(calibrated_e
     q_last = seen["q"][:, -1].to(F64).reshape(2, N_HEADS, HEAD_DIM)
     expected = rayleigh_quotient(e._risk_sigma[0].expand(2, -1, -1, -1), q_last)
     torch.testing.assert_close(live[0], expected)
-    assert all(torch.all((v >= 0) & (v <= 1)) for v in live.values())
+    assert all(torch.all(v >= 0) for v in live.values())  # Σ PSD; sin normalizar no está acotado por 1
     assert e.collect_telemetry() == {}  # clear=True vacía el buffer
 
 
@@ -481,10 +482,9 @@ def test_layer_plan_hooks_only_planned_layers_with_own_alpha_and_mode(calibrated
     assert e.active_layers == [0, 2] and len(e._handles) == 2  # re-registrado en caliente
     vecs = e.effective_vectors()
     torch.testing.assert_close(vecs[0], 3.0 * e.steering_vectors[0])  # aditivo puro
-    kv_idx = e.geometry.kv_index()
     for h in range(N_HEADS):
         r = e.steering_vectors[2][h]
-        expected = e.projectors[2].projector[kv_idx[h]] @ r if e.risk_mask[2][h] else r
+        expected = e.projectors[2].projector[h] @ r if e.risk_mask[2][h] else r
         torch.testing.assert_close(vecs[2][h], -1.5 * expected)
 
     batch = random_batch(n=1, t=3, seed=11)
@@ -513,13 +513,15 @@ def test_layer_plan_rejects_uncalibrated_layers():
 # Σ_ΔK por Focus Set / Tail Set sobre el utility set
 # --------------------------------------------------------------------------- #
 def brute_force_focus_tail(keys, attention, mask, tau, num_kv):
-    """Referencia literal: enumera cada par (query, i ∈ Focus, j ∈ Tail)."""
+    """Referencia literal de SKOP (Ec. 11): por cada cabeza de query y paso, Focus =
+    conjunto mínimo con masa ≥ tau (por probabilidad descendente), Tail = resto, y
+    media de ΔkΔkᵀ sobre todos los pares; los pasos sin Focus o sin Tail no cuentan."""
     b_, h_, t_, _ = attention.shape
     d = keys.shape[-1] // num_kv
     group = h_ // num_kv
     k = keys.to(F64).view(b_, t_, num_kv, d)
-    sums = torch.zeros(num_kv, d, d, dtype=F64)
-    pairs = torch.zeros(num_kv, dtype=F64)
+    sums = torch.zeros(h_, d, d, dtype=F64)
+    steps = torch.zeros(h_, dtype=F64)
     for b in range(b_):
         for h in range(h_):
             g = h // group
@@ -527,14 +529,25 @@ def brute_force_focus_tail(keys, attention, mask, tau, num_kv):
                 if not mask[b, t]:
                     continue
                 valid = [s for s in range(t_) if mask[b, s] and attention[b, h, t, s] > 0]
-                focus = [s for s in valid if attention[b, h, t, s] > tau]
+                total = sum(float(attention[b, h, t, s]) for s in valid)
+                ranked = sorted(valid, key=lambda s: -float(attention[b, h, t, s]))  # estable
+                focus, mass = [], 0.0
+                for s in ranked:
+                    if mass >= tau:
+                        break
+                    focus.append(s)
+                    mass += float(attention[b, h, t, s]) / total
                 tail = [s for s in valid if s not in focus]
+                if not focus or not tail:
+                    continue
+                step = torch.zeros(d, d, dtype=F64)
                 for i in focus:
                     for j in tail:
                         dk = k[b, i, g] - k[b, j, g]
-                        sums[g] += torch.outer(dk, dk)
-                        pairs[g] += 1
-    return sums, pairs
+                        step += torch.outer(dk, dk)
+                sums[h] += step / (len(focus) * len(tail))
+                steps[h] += 1
+    return sums, steps
 
 
 def synthetic_attention(b, h, t, mask, seed):
@@ -547,31 +560,66 @@ def synthetic_attention(b, h, t, mask, seed):
     return torch.nan_to_num(probs, nan=1.0 / t)
 
 
-@pytest.mark.parametrize("tau", [0.05, 0.2, 0.5])
+@pytest.mark.parametrize(
+    "probs,tau,expected",
+    [
+        ([0.5, 0.3, 0.15, 0.05], 0.8, [0, 1]),       # 0.5 + 0.3 alcanza 0.8 justo
+        ([0.5, 0.3, 0.15, 0.05], 0.81, [0, 1, 2]),
+        ([0.05, 0.5, 0.15, 0.3], 0.8, [1, 3]),       # el orden es por masa, no por posición
+        ([0.4, 0.4, 0.2], 0.5, [0, 1]),
+        ([0.4, 0.4, 0.2], 0.3, [0]),                 # empate: gana la primera posición
+        ([0.9, 0.1, 0.0], 0.95, [0, 1]),             # la key con masa 0 nunca entra
+    ],
+)
+def test_focus_set_is_the_minimal_cover_of_tau_mass(probs, tau, expected):
+    p = torch.tensor([[probs]])
+    focus = focus_set_mask(p, p > 0, tau)
+    assert focus[0, 0].nonzero().flatten().tolist() == expected
+
+
+def test_focus_mass_is_measured_over_attendable_keys():
+    p = torch.tensor([[[0.3, 0.2, 0.25, 0.25]]])
+    attendable = torch.tensor([[[True, True, False, False]]])  # p. ej. padding
+    assert focus_set_mask(p, attendable, 0.5)[0, 0].tolist() == [True, False, False, False]  # 0.3/0.5 = 0.6
+
+
+def test_each_step_weighs_the_same_regardless_of_its_number_of_pairs():
+    """Ec. 11: E_t E_(i,j)~U(F_t×T_t). El paso con 2 pares no pesa el doble que el de 1."""
+    keys = torch.tensor([[[1.0, 0.0], [0.0, 0.0], [0.0, 2.0]]])  # (B=1, T=3, d=2)
+    attn = torch.tensor([[[[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.85, 0.1, 0.05]]]])
+    sums, steps = focus_tail_second_moment(keys, attn, torch.ones(1, 3), tau_high=0.8, num_kv_heads=1)
+    assert steps.tolist() == [2.0]  # la query 0 sólo ve una key: sin Tail, no cuenta
+    expected = torch.tensor([[1.0, -0.5], [-0.5, 1.0]], dtype=F64)  # (paso 1 + media del paso 2) / 2
+    torch.testing.assert_close(sums[0] / steps[0], expected)
+    by_pairs = torch.tensor([[1.0, -2 / 3], [-2 / 3, 4 / 3]], dtype=F64)  # ponderación v2, por pares
+    assert not torch.allclose(sums[0] / steps[0], by_pairs)
+
+
+@pytest.mark.parametrize("tau", [0.5, 0.8, 0.95])
 def test_focus_tail_factorization_matches_brute_force(tau):
     mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0, 0]])
     keys = torch.randn(3, 7, 2 * 5, generator=torch.Generator().manual_seed(1))
     attn = synthetic_attention(3, 4, 7, mask, seed=2)
-    sums, pairs = focus_tail_second_moment(keys, attn, mask, tau, num_kv_heads=2)
-    ref_sums, ref_pairs = brute_force_focus_tail(keys, attn, mask, tau, num_kv=2)
-    assert pairs.sum() > 0
-    torch.testing.assert_close(pairs, ref_pairs)
+    sums, steps = focus_tail_second_moment(keys, attn, mask, tau, num_kv_heads=2)
+    ref_sums, ref_steps = brute_force_focus_tail(keys, attn, mask, tau, num_kv=2)
+    assert steps.shape == (4,) and steps.min() > 0  # por cabeza de query (GQA 4 -> 2)
+    torch.testing.assert_close(steps, ref_steps)
     torch.testing.assert_close(sums, ref_sums, rtol=1e-4, atol=1e-4)
     assert sums.dtype == F64 and sums.device.type == "cpu"
 
 
-def test_focus_tail_is_empty_when_no_key_exceeds_tau():
+def test_focus_tail_is_empty_when_the_focus_needs_every_key():
     mask = torch.ones(1, 6, dtype=torch.long)
     uniform = torch.ones(6, 6).tril()
     attn = (uniform / uniform.sum(-1, keepdim=True)).expand(1, 2, 6, 6)
-    _, pairs = focus_tail_second_moment(torch.randn(1, 6, 4), attn, mask, tau_high=0.9, num_kv_heads=1)
-    assert pairs.sum() == 0
+    _, steps = focus_tail_second_moment(torch.randn(1, 6, 4), attn, mask, tau_high=0.9, num_kv_heads=1)
+    assert steps.sum() == 0  # con atención uniforme sobre ≤ 6 keys, 0.9 de la masa las necesita todas
 
 
 def test_engine_utility_sigma_matches_brute_force_on_real_attention():
     torch.manual_seed(3)
     model = TinyCausalLM().eval()
-    engine = SKOPEngine(model, SKOPConfig(layers=[0, 1], tau_high=0.2))
+    engine = SKOPEngine(model, SKOPConfig(layers=[0, 1]))  # tau_high = 0.8, como en SKOP
     batch = random_batch(n=3, t=9, seed=5)
     batch["attention_mask"][1, :3] = 0  # padding izquierdo
     batch["attention_mask"][2, 6:] = 0  # padding derecho
@@ -586,9 +634,9 @@ def test_engine_utility_sigma_matches_brute_force_on_real_attention():
 
     engine.accumulate_utility_batch(batch)
     engine.finalize_calibration()
-    ref_sums, ref_pairs = brute_force_focus_tail(captured["k"], captured["w"], batch["attention_mask"], 0.2, N_KV)
-    assert ref_pairs.min() > 0
-    torch.testing.assert_close(engine.sigma_delta_k[1], ref_sums / ref_pairs[:, None, None], rtol=1e-4, atol=1e-5)
+    ref_sums, ref_steps = brute_force_focus_tail(captured["k"], captured["w"], batch["attention_mask"], 0.8, N_KV)
+    assert ref_steps.min() > 0
+    torch.testing.assert_close(engine.sigma_delta_k[1], ref_sums / ref_steps[:, None, None], rtol=1e-4, atol=1e-5)
     assert engine.num_utility_samples == 3
 
 
@@ -707,6 +755,30 @@ def test_layers_out_of_range_are_rejected_instead_of_wrapping(layers):
         SKOPEngine(TinyCausalLM(), SKOPConfig(layers=layers))
 
 
+def test_defaults_follow_the_skop_paper():
+    config = SKOPConfig()
+    assert (config.tau_high, config.gamma_energy, config.risk_percentile) == (0.8, 0.9, 0.8)
+    assert config.normalize_rayleigh is False and ARTIFACT_FORMAT == "latentflow.skop/v3"
+
+
+def test_v2_artifacts_are_rejected(calibrated_engine):
+    state = calibrated_engine.state_dict()
+    state["format"] = "latentflow.skop/v2"
+    with pytest.raises(ValueError, match=r"'latentflow.skop/v2'.*latentflow-calibrate"):
+        SKOPEngine(calibrated_engine.model).load_state_dict(state)
+
+
+def test_risk_is_the_absolute_rayleigh_energy_of_eq_16(calibrated_engine):
+    e = calibrated_engine
+    eps = e.config.eps
+    for l in e.layer_ids:
+        r, sigma = e.direction_for(l), e.sigma_delta_k[l]
+        expected = torch.stack([(r[h] @ sigma[h] @ r[h]) / (r[h] @ r[h] + eps) for h in range(N_HEADS)])
+        torch.testing.assert_close(e.rayleigh[l], expected, rtol=1e-12, atol=0)
+    scores = torch.stack([e.rayleigh[l] for l in e.layer_ids])
+    assert e.risk_threshold == pytest.approx(torch.quantile(scores.flatten(), 0.8).item())
+
+
 def test_tau_high_is_validated():
     with pytest.raises(ValueError, match="tau_high"):
         SKOPConfig(tau_high=1.0)
@@ -760,9 +832,9 @@ def test_residual_to_query_applies_the_real_input_layernorm():
 def test_sae_direction_injection_keeps_symmetry_and_rayleigh_bounds(calibrated_engine):
     """Σ_ΔK viene de la factorización Kᵀ G K (utility set). Inyectar columnas SAE
     sólo cambia r_q: Σ y P siguen simétricos (P idempotente) y el cociente de
-    Rayleigh de la nueva dirección queda entre los autovalores de Σ̂ = Σ/tr(Σ)."""
+    Rayleigh (absoluto, como en SKOP) de la nueva dirección queda entre los
+    autovalores de Σ."""
     e = calibrated_engine
-    kv_idx = e.geometry.kv_index()
     calibrated = {l: e.steering_vectors[l].clone() for l in e.layer_ids}
     before_rayleigh = {l: e.rayleigh[l].clone() for l in e.layer_ids}
     directions = {0: e.residual_to_query(0, sae_column(2)), 2: 2.5 * e.residual_to_query(2, sae_column(3))}
@@ -774,12 +846,10 @@ def test_sae_direction_injection_keeps_symmetry_and_rayleigh_bounds(calibrated_e
         P = e.projectors[l].projector
         assert torch.equal(P, P.mT)
         torch.testing.assert_close(P @ P, P, rtol=0, atol=1e-10)
-        sigma_hat = trace_normalize(sigma, e.config.rayleigh_eps)[kv_idx]
-        evals = torch.linalg.eigvalsh(sigma_hat)
+        evals = torch.linalg.eigvalsh(sigma)
         r = e.direction_for(l)
-        torch.testing.assert_close(e.rayleigh[l], rayleigh_quotient(sigma_hat, r))
+        torch.testing.assert_close(e.rayleigh[l], rayleigh_quotient(sigma, r))
         assert torch.all(e.rayleigh[l] >= evals[:, 0] - 1e-12) and torch.all(e.rayleigh[l] <= evals[:, -1] + 1e-12)
-        assert torch.all((e.rayleigh[l] >= 0) & (e.rayleigh[l] <= 1))
 
     # Las capas sin inyección conservan su r_q calibrado; los r_q calibrados no se tocan.
     torch.testing.assert_close(e.direction_for(1), calibrated[1])
@@ -793,15 +863,14 @@ def test_sae_direction_is_projected_only_on_globally_risky_heads(calibrated_engi
     e.set_layer_directions({1: e.residual_to_query(1, sae_column(4))})
     scores = torch.stack([e.rayleigh[l] for l in e.layer_ids])
     assert sum(int(e.risk_mask[l].sum()) for l in e.layer_ids) == int((scores > e.risk_threshold).sum())
-    kv_idx = e.geometry.kv_index()
     v = e.effective_vectors()[1]
     r = e.direction_for(1)
     for h in range(N_HEADS):
         res = e.projectors[1]
         if e.risk_mask[1][h]:
-            U = res.retained_basis()[kv_idx[h]]
+            U = res.retained_basis()[h]
             torch.testing.assert_close(U.mT @ v[h], torch.zeros(HEAD_DIM, dtype=F64), rtol=0, atol=1e-10)
-            torch.testing.assert_close(v[h], e.alpha * res.projector[kv_idx[h]] @ r[h])
+            torch.testing.assert_close(v[h], e.alpha * res.projector[h] @ r[h])
         else:
             torch.testing.assert_close(v[h], e.alpha * r[h])
 

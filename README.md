@@ -190,12 +190,18 @@ latentflow-calibrate --utility data/alpaca.jsonl --utility data/gsm8k.jsonl \
 
 Revisa el resumen que imprime:
 
-- **`pares Focus × Tail`** debe ser > 0. Si es 0, ninguna key supera `tau_high`; prueba un `--tau-high` menor.
+- **`pasos (cabeza × query) con Focus y Tail`** debe ser > 0. Si es 0, los textos
+  son demasiado cortos o `--tau-high` es tan alto que el Focus Set se lleva todas
+  las keys; usa textos más largos o baja `--tau-high` (SKOP usa 0.8).
 - **`rango medio de U_ΔK`** indica cuántas direcciones elimina P_ΔK (γ = 0.90).
 
 Con `--layers 18-22` sólo se calibran esas capas (un índice fuera del modelo es un
 error, no se reinterpreta). El servidor adopta las capas del artefacto: las anuncia
 en `ready.layers` y responde `invalid_layer` a cualquier otra.
+
+El artefacto es `latentflow.skop/v3` (Focus Set por masa, media por pasos y
+$\Sigma_{\Delta K}$ por cabeza de query). Los de la versión anterior (`v2`) se
+rechazan al cargar: hay que regenerarlos con `latentflow-calibrate`.
 
 ### 6. Arrancar el servidor
 
@@ -245,21 +251,31 @@ La cabecera debe mostrar **SAE: Gemma Scope local**.
 
 ### SKOP en una página
 
-Para cada capa ℓ y cabeza *h* (con GQA, cada cabeza KV agrupa varias de query):
+El motor sigue el Algoritmo 1 de SKOP ([Luo, Espinosa Zarlenga y Jamnik,
+arXiv:2605.06342](https://arxiv.org/abs/2605.06342)) con los hiperparámetros del
+paper: $\tau_{\text{high}} = 0.8$, $\gamma = 0.9$ y el 20 % de las cabezas. Todo es
+**por cabeza de query** (capa ℓ, cabeza *h*); con GQA, cada cabeza usa las keys de
+su grupo KV.
 
-**1. Geometría de keys (utility set, modelo base).** Para cada query *t* y su
-distribución de atención real $a_t$, el *Focus Set* y el *Tail Set* son
+**1. Geometría de keys (utility set, modelo base).** Para cada paso (query) *t*
+con distribución de atención real $a_t$, el *Focus Set* es el conjunto mínimo de
+keys que acumula al menos $\tau_{\text{high}}$ de la masa, y el *Tail Set* es el
+resto de keys atendibles:
 
 $$
-\mathcal{F}_t = \{\, s : a_{ts} > \tau_{\text{high}} \,\}, \qquad
-\mathcal{T}_t = \{\, s : a_{ts} > 0 \,\} \setminus \mathcal{F}_t ,
+\mathcal{F}_t = \operatorname*{arg\,min}_{S}\Big\{\, |S| \;:\; \textstyle\sum_{s \in S} a_{ts} \ge \tau_{\text{high}} \Big\}, \qquad
+\mathcal{T}_t = \{\, s : a_{ts} > 0 \,\} \setminus \mathcal{F}_t .
 $$
 
-y el segundo momento de las diferencias de keys sobre todos los pares es
+$\mathcal F_t$ se construye ordenando las keys por probabilidad descendente (los
+empates, por posición) y añadiéndolas hasta cubrir la masa. El segundo momento
+(sin centrar) promedia los pares de cada paso y da a todos los pasos el mismo peso:
 
 $$
-\Sigma_{\Delta K} \;=\; \mathbb{E}_{\,t,\; i \in \mathcal{F}_t,\; j \in \mathcal{T}_t}\!\left[ (k_i - k_j)(k_i - k_j)^{\top} \right].
+\Sigma_{\Delta K} \;=\; \mathbb{E}_{t}\; \mathbb{E}_{(i,j) \sim \mathcal{U}(\mathcal{F}_t \times \mathcal{T}_t)}\!\left[ (k_i - k_j)(k_i - k_j)^{\top} \right].
 $$
+
+Los pasos sin Tail (p. ej. la primera query, que sólo ve una key) no cuentan.
 
 **2. Subespacio de riesgo.** Con $\Sigma_{\Delta K} = V \Lambda V^{\top}$ y los
 autovalores en orden descendente, se retienen las $k$ primeras direcciones hasta
@@ -272,15 +288,18 @@ $$
 
 de modo que $P^2 = P$ y $P^{\top} = P$ (los tests lo verifican en float64).
 
-**3. Ranking de riesgo.** El cociente de Rayleigh sobre la matriz normalizada por
-traza es comparable entre capas de escalas distintas:
+**3. Ranking de riesgo.** El cociente de Rayleigh mide la energía absoluta con la
+que la dirección perturba el gap de score entre Focus y Tail, por unidad de norma:
 
 $$
-\hat{\Sigma} = \frac{\Sigma_{\Delta K}}{\operatorname{tr}(\Sigma_{\Delta K}) + \varepsilon}, \qquad
-R_h(r) = \frac{r^{\top} \hat{\Sigma}\, r}{r^{\top} r} \;\in\; \big[\lambda_{\min}(\hat\Sigma),\, \lambda_{\max}(\hat\Sigma)\big] \subseteq [0, 1].
+R_h(r) = \frac{r^{\top} \Sigma_{\Delta K}\, r}{\lVert r \rVert^2 + \varepsilon} \;\in\; \big[\lambda_{\min},\, \lambda_{\max}\big].
 $$
 
-Las cabezas por encima del percentil 80 global (todas las capas) son de riesgo.
+Las cabezas por encima del percentil 80 global (todas las capas calibradas) son de
+riesgo. `SKOPConfig(normalize_rayleigh=True)` usa en su lugar
+$\hat\Sigma = \Sigma_{\Delta K} / (\operatorname{tr}\Sigma_{\Delta K} + \varepsilon)$, que acota
+$R_h$ en $[0, 1]$ y lo hace comparable entre capas de escalas distintas. Es una
+opción nuestra, desactivada por defecto.
 
 **4. Inyección.**
 
@@ -294,10 +313,17 @@ apenas altera la diferencia de score entre tokens Focus y Tail. Es decir, conser
 el patrón de atención del modelo base. $P_{\Delta K} r_q$ y $r_q$ se precalculan
 en float64, así que en inferencia sólo queda una suma vectorial por capa.
 
+> **RoPE.** Las keys de $\Sigma_{\Delta K}$ y el steering viven en el espacio previo
+> a RoPE. En el score real, la perturbación de la query *t* frente a la key *i* es
+> $\delta q^{\top} R_{i-t}\, k_i$, con $R_{i-t}$ la rotación relativa. La protección
+> de $P_{\Delta K}$ es exacta sólo donde esa rotación es pequeña (las frecuencias
+> bajas de RoPE) y aproximada en las altas. El paper no trata este punto; falta
+> medir su efecto con pesos reales.
+
 ### La factorización exacta Kᵀ G K
 
-Enumerar los pares es prohibitivo: por cada query hay hasta $|\mathcal F_t|\,|\mathcal T_t|$
-productos exteriores de coste $d^2$. Desarrollando el producto, para una query:
+Enumerar los pares es prohibitivo: por cada paso hay hasta $|\mathcal F_t|\,|\mathcal T_t|$
+productos exteriores de coste $d^2$. Desarrollando el producto, para un paso:
 
 $$
 \sum_{i \in \mathcal{F}_t} \sum_{j \in \mathcal{T}_t} (k_i - k_j)(k_i - k_j)^{\top}
@@ -308,20 +334,21 @@ $$
 
 con $s^{F}_t = \sum_{i \in \mathcal F_t} k_i$ y $s^{T}_t = \sum_{j \in \mathcal T_t} k_j$.
 Con las máscaras binarias $M_F, M_T \in \{0,1\}^{T \times T}$ (fila = query,
-columna = key) y $n^F = M_F \mathbf{1}$, $n^T = M_T \mathbf{1}$, la suma sobre
-todas las queries es una única forma cuadrática:
+columna = key), $n^F = M_F \mathbf{1}$, $n^T = M_T \mathbf{1}$ y el peso de cada
+paso $c_t = 1 / (n^F_t\, n^T_t)$ (0 si alguno es vacío), la suma ponderada sobre
+todos los pasos es una única forma cuadrática:
 
 $$
-\boxed{\; \sum_t \sum_{i,j} (k_i - k_j)(k_i - k_j)^{\top} \;=\; K^{\top} G\, K \;}
+\boxed{\; \sum_t c_t \sum_{i,j} (k_i - k_j)(k_i - k_j)^{\top} \;=\; K^{\top} G\, K \;}
 \qquad
 G = \operatorname{diag}(w) - C - C^{\top},\quad
-w = M_F^{\top} n^T + M_T^{\top} n^F,\quad
-C = M_F^{\top} M_T ,
+w = M_F^{\top} \tfrac{1}{n^F} + M_T^{\top} \tfrac{1}{n^T},\quad
+C = M_F^{\top} \operatorname{diag}(c)\, M_T ,
 $$
 
-donde $K \in \mathbb{R}^{T \times d}$ son las keys de la cabeza y el número de
-pares es $N = (n^F)^{\top} n^T$. Con GQA, $G$ se suma sobre las cabezas de query
-de cada grupo antes de multiplicar por $K$.
+donde $K \in \mathbb{R}^{T \times d}$ son las keys que usa la cabeza ($1/n$ se toma
+elemento a elemento y sólo en los pasos con $c_t > 0$). Dividiendo por el número de
+pasos con Focus y Tail no vacíos se obtiene $\Sigma_{\Delta K}$.
 
 | | Enumeración de pares | Factorización $K^{\top} G K$ |
 | --- | --- | --- |
@@ -329,15 +356,16 @@ de cada grupo antes de multiplicar por $K$.
 | Memoria | $O(d^2)$ | $O(T^2)$ para $G$ |
 | Forma | bucles con datos dependientes | productos matriciales densos (`einsum`) en el device |
 
-Los términos son $C = M_F^{\top} M_T$ ($T^3$), $G K$ ($T^2 d$) y $K^{\top}(G K)$
-($T d^2$). Para Gemma-2-2B ($d = 256$) y $T = 256$, el peor caso de la enumeración
-ronda las $10^{11}$ operaciones por cabeza frente a unas $5 \cdot 10^{7}$ de la
+Los términos son $C$ ($T^3$), $G K$ ($T^2 d$) y $K^{\top}(G K)$ ($T d^2$). Para
+Gemma-2-2B ($d = 256$) y $T = 256$, el peor caso de la enumeración ronda las
+$10^{11}$ operaciones por cabeza frente a unas $5 \cdot 10^{7}$ de la
 factorización. Con Focus Sets pequeños, que es lo típico, $P$ es mucho menor y la
 ventaja es más modesta, pero el coste de la factorización no depende de $P$ y se
 ejecuta como álgebra densa. Cada capa se reduce en el device y sólo baja a la CPU
 la matriz $d \times d$ en float64. La implementación
-([`focus_tail_second_moment`](latentflow/core/steering.py)) se valida contra una
-suma por fuerza bruta, con padding a izquierda y derecha y GQA.
+([`focus_tail_second_moment`](latentflow/core/steering.py)) se valida contra la
+definición literal (Focus por masa, media por paso), con padding a izquierda y
+derecha y GQA. La factorización es nuestra; el paper sólo define la esperanza.
 
 ### De una feature de SAE a una dirección de query
 
@@ -352,9 +380,16 @@ r_q^{(\ell)}(f) = W_Q^{(\ell)} \cdot \operatorname{RMSNorm}^{(\ell)}\!\big(W_{\t
 r^{(\ell)} = \alpha \sum_f \alpha_f\, r_q^{(\ell)}(f).
 $$
 
-La dirección es exacta; la escala absoluta depende de la norma RMS de cada token.
-El ranking de Rayleigh se recalcula con $r^{(\ell)}$, así que $P_{\Delta K}$ se
-aplica sólo a las cabezas de alto riesgo *para esa feature*.
+Es una **aproximación**: RMSNorm se evalúa en $v = W_{\text{dec}}[f]$ y no en el
+residual $h$ de cada token. Su Jacobiano real,
+$J(h)\, v = g \odot \big(v - h\, \tfrac{h^{\top} v}{\lVert h \rVert^2}\big) / \operatorname{rms}(h)$,
+coincide en dirección sólo si $v \perp h$. En el modelo de desarrollo, la similitud
+coseno con el cambio real de la query es ≈ 0.99 para una $v$ aleatoria, pero su
+mediana baja a 0.87 o 0.72 (mínimo 0.54) cuando $v$ se alinea parcial o fuertemente
+con el residual, que es justo el caso de una feature activa. La escala tampoco es la real: aquí la fija $|v|$; en el modelo,
+$\operatorname{rms}(h)$. El vector resultante vive en el espacio previo a RoPE (ver
+la nota de RoPE). El ranking de Rayleigh se recalcula con $r^{(\ell)}$, así que
+$P_{\Delta K}$ se aplica sólo a las cabezas de alto riesgo *para esa feature*.
 
 ## Contrato del WebSocket `/ws/stream`
 
@@ -497,7 +532,7 @@ texto se emite con el token siguiente.
 
 | Campo | Significado |
 | --- | --- |
-| `rayleigh` | $R_h(q)$ normalizado de la query **actual** (ya steerada) de esa cabeza, en [0, 1] |
+| `rayleigh` | $R_h(q)$ de la query **actual** (ya steerada) de esa cabeza: energía absoluta ≥ 0, o en [0, 1] si `normalize_rayleigh` |
 | `baseline` | $R_h(r)$ de la dirección de steering de la capa (calibración o feature) |
 | `risky` | La cabeza supera el percentil de riesgo global |
 | `steered` | Su capa recibe steering |

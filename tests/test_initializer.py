@@ -84,15 +84,15 @@ def test_cli_generates_artifact_that_server_cold_loads(datasets, tmp_path, monke
     assert state["format"] == ARTIFACT_FORMAT
     assert state["layer_ids"] == list(range(DEV_LAYERS))
     assert state["num_utility_samples"] == 6 and state["num_concept_pairs"] == 3
-    assert state["num_delta_pairs"] > 0
+    assert state["num_delta_steps"] > 0
     g = state["geometry"]
     for l in state["layer_ids"]:
-        assert state["sigma_delta_k"][l].shape == (g["num_kv_heads"], g["head_dim"], g["head_dim"])
+        assert state["sigma_delta_k"][l].shape == (g["num_heads"], g["head_dim"], g["head_dim"])
         assert state["sigma_delta_k"][l].dtype == torch.float64
         assert state["steering_vectors"][l].shape == (g["num_heads"], g["head_dim"])
     meta = state["meta"]
     assert meta["model_id"].startswith("dev/tiny-llama-3L") and meta["quantization"] == "dev"
-    assert meta["config"]["tau_high"] == 0.1 and len(meta["datasets"]["utility"]) == 2
+    assert meta["config"]["tau_high"] == 0.8 and len(meta["datasets"]["utility"]) == 2
     assert len(meta["datasets"]["concept"]["sha256"]) == 64
 
     # Carga en frío: el servidor arranca sin calibrar nada y usa el artefacto.

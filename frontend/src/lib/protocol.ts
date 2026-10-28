@@ -93,7 +93,7 @@ export interface CircuitSnapshot {
 export interface HeadTelemetry {
   layer: number
   head: number
-  /** Cociente de Rayleigh normalizado de la query actual, en [0, 1]. */
+  /** Cociente de Rayleigh de la query actual: energía absoluta (≥ 0), o en [0, 1] si `normalize_rayleigh`. */
   rayleigh: number
   /** Cociente del vector de steering r_q (calibración). */
   baseline: number

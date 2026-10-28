@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { HeadTelemetry, Telemetry } from './protocol'
-import { niceCeil, windowStart, yMaxFor } from './scopeRenderer'
+import { fmt, niceCeil, windowStart, yMaxFor } from './scopeRenderer'
 import { TelemetryBuffer } from './telemetryBuffer'
 
 const head = (layer: number, h: number, rayleigh: number, risky = true): HeadTelemetry => ({
@@ -84,10 +84,25 @@ describe('escala del osciloscopio', () => {
     expect(niceCeil(Number.NaN)).toBe(0.005)
   })
 
+  it('las etiquetas usan ~3 cifras significativas en cualquier magnitud', () => {
+    expect([fmt(0.0421), fmt(3.14159), fmt(38.27), fmt(612.4), fmt(0.00002), fmt(Number.NaN)]).toEqual([
+      '0.042', '3.14', '38.3', '612', '2.0e-5', '—',
+    ])
+  })
+
+  it('niceCeil no recorta el Rayleigh absoluto, que no está acotado por 1', () => {
+    expect(niceCeil(1.3)).toBe(2)
+    expect(niceCeil(38)).toBe(40)
+    expect(niceCeil(612)).toBe(750)
+    expect(niceCeil(1000)).toBe(1000)
+  })
+
   it('el eje Y auto cubre el máximo de la ventana y el umbral', () => {
     const buf = new TelemetryBuffer(8)
     buf.push(0, tel([head(0, 0, 0.04)], 0.08))
     expect(yMaxFor(buf, 'auto')).toBe(0.1)
     expect(yMaxFor(buf, 'unit')).toBe(1)
+    buf.push(1, tel([head(0, 0, 230)], 180))
+    expect(yMaxFor(buf, 'auto')).toBe(400) // 230 · 1.15 = 264.5 -> 400
   })
 })
