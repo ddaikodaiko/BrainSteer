@@ -20,6 +20,7 @@ test = ["pytest>=7", "pytest-timeout", "httpx", "websockets>=12"]
 [project.scripts]
 latentflow-server = "latentflow.api.server:main"
 latentflow-dev = "latentflow.tools.dev_backend:main"
+latentflow-calibrate = "latentflow.tools.initializer:main"
 
 [tool.setuptools.packages.find]
 include = ["latentflow*"]

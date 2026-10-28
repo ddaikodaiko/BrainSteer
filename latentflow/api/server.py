@@ -24,7 +24,7 @@ Cliente -> servidor (JSON, campo ``action``)::
                 {"layer": 12, "alpha": -1.0, "mode": "additive"}]}
     {"action": "update", "reset_layers": true}
     {"action": "cancel"}
-    {"action": "calibrate", "positive": ["..."], "negative": ["..."]}
+    {"action": "calibrate", "utility": ["..."], "positive": ["..."], "negative": ["..."]}
     {"action": "status"}
     {"action": "ping"}
 
@@ -235,7 +235,10 @@ class CancelRequest(_Message):
 
 
 class CalibrateRequest(_Message):
+    """``utility`` estima Σ_ΔK (Focus/Tail); ``positive``/``negative``, ``r_q``."""
+
     action: Literal["calibrate"]
+    utility: List[str] = Field(min_length=1)
     positive: List[str] = Field(min_length=1)
     negative: List[str] = Field(min_length=1)
 
@@ -617,11 +620,11 @@ class InferenceRuntime:
         mask = torch.ones_like(input_ids) if mask is None else mask.to(device)
         return input_ids, mask
 
-    def calibrate(self, positive: List[str], negative: List[str]) -> Dict[str, Any]:
+    def calibrate(self, utility: List[str], positive: List[str], negative: List[str]) -> Dict[str, Any]:
         was_attached = self.engine.is_attached
         self.engine.detach()
         try:
-            self.engine.calibrate(positive, negative).fit()
+            self.engine.calibrate(utility, positive, negative).fit()
         finally:
             if was_attached and self.engine.is_fitted:
                 self.engine.attach()
@@ -801,7 +804,7 @@ class StreamSession:
         if self.runtime.tokenizer is None:
             self.send(_error("no_tokenizer", "El runtime no tiene tokenizer"))
             return
-        future = self.runtime.submit(self.runtime.calibrate, msg.positive, msg.negative)
+        future = self.runtime.submit(self.runtime.calibrate, msg.utility, msg.positive, msg.negative)
 
         def _done(f: "asyncio.Future[Any]") -> None:
             if f.cancelled():
@@ -810,7 +813,8 @@ class StreamSession:
                 self.send(_error("calibration_failed", f"{type(f.exception()).__name__}: {f.exception()}"))
                 return
             snapshot = f.result()
-            self.send({"type": "calibrated", "num_pairs": len(msg.positive), "circuit": snapshot})
+            self.send({"type": "calibrated", "num_pairs": len(msg.positive), "num_utility": len(msg.utility),
+                       "circuit": snapshot})
             self.runtime._broadcast_now({"type": "circuit", "changes": {"calibrated": True},
                                          "applied_at_index": None, "request_id": None, "circuit": snapshot})
 

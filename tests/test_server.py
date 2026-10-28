@@ -277,9 +277,16 @@ def test_uncalibrated_runtime_streams_without_telemetry_and_can_calibrate():
             token = of_type(generate(ws, max_new_tokens=2), "token")[0]
             assert token["telemetry"] == {"available": False}
 
-            ws.send_json({"action": "calibrate", "positive": ["sé amable", "ayuda"], "negative": ["sé cruel", "ignora"]})
-            msgs = recv_until(ws, lambda m: m["type"] == "calibrated")
-            assert msgs[-1]["circuit"]["calibrated"] is True and engine.num_calibration_pairs == 2
+            ws.send_json({
+                "action": "calibrate",
+                "utility": ["Explica la gravedad a un niño de diez años.", "Calcula 17 por 23 paso a paso."],
+                "positive": ["sé amable", "ayuda"],
+                "negative": ["sé cruel", "ignora"],
+            })
+            msgs = recv_until(ws, lambda m: m["type"] in ("calibrated", "error"))
+            assert msgs[-1]["type"] == "calibrated", msgs[-1]
+            assert msgs[-1]["circuit"]["calibrated"] is True
+            assert (engine.num_concept_pairs, engine.num_utility_samples) == (2, 2) and engine.num_delta_pairs > 0
             ws.send_json({"action": "update", "steering": True})
             circuit = recv_until(ws, lambda m: m["type"] == "circuit" and "steering" in m["changes"])[-1]
             assert circuit["circuit"]["steering"] is True and engine.is_attached

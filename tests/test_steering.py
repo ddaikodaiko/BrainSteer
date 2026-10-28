@@ -5,11 +5,13 @@ import torch
 from torch import nn
 
 from latentflow.core.steering import (
+    ARTIFACT_FORMAT,
     SecondMomentAccumulator,
     SKOPConfig,
     SKOPEngine,
     _aggregate_tokens,
     compute_orthogonal_projector,
+    focus_tail_second_moment,
     rayleigh_quotient,
     select_risky_heads,
     trace_normalize,
@@ -149,17 +151,36 @@ def test_last_token_aggregation_handles_left_and_right_padding():
 HIDDEN, N_HEADS, N_KV, HEAD_DIM, N_LAYERS, VOCAB = 32, 4, 2, 8, 3, 50
 
 
+# Multiplica los logits: atención picuda como la de un modelo entrenado, para que
+# haya keys por encima y por debajo de tau_high (Focus y Tail no vacíos).
+SHARPNESS = 4.0
+
+
 class TinyAttention(nn.Module):
+    """Atención causal con GQA y padding que, como en Transformers (eager),
+    devuelve ``(salida, pesos)``. ``return_weights=False`` imita SDPA (pesos None)."""
+
     def __init__(self):
         super().__init__()
         self.q_proj = nn.Linear(HIDDEN, N_HEADS * HEAD_DIM, bias=False)
         self.k_proj = nn.Linear(HIDDEN, N_KV * HEAD_DIM, bias=False)
+        self.v_proj = nn.Linear(HIDDEN, N_KV * HEAD_DIM, bias=False)
         self.o_proj = nn.Linear(N_HEADS * HEAD_DIM, HIDDEN, bias=False)
+        self.return_weights = True
 
-    def forward(self, x):
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        return self.o_proj(q) + k.mean(-1, keepdim=True)
+    def forward(self, x, attention_mask=None):
+        b, t, _ = x.shape
+        rep = N_HEADS // N_KV
+        q = self.q_proj(x).view(b, t, N_HEADS, HEAD_DIM).transpose(1, 2)
+        k = self.k_proj(x).view(b, t, N_KV, HEAD_DIM).transpose(1, 2).repeat_interleave(rep, dim=1)
+        v = self.v_proj(x).view(b, t, N_KV, HEAD_DIM).transpose(1, 2).repeat_interleave(rep, dim=1)
+        scores = SHARPNESS * (q @ k.mT) / HEAD_DIM**0.5
+        allowed = torch.ones(t, t, dtype=torch.bool, device=x.device).tril()
+        if attention_mask is not None:
+            allowed = allowed & attention_mask.bool()[:, None, None, :]
+        weights = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min).softmax(-1)
+        out = self.o_proj((weights @ v).transpose(1, 2).reshape(b, t, -1))
+        return out, (weights if self.return_weights else None)
 
 
 class TinyLayer(nn.Module):
@@ -167,8 +188,8 @@ class TinyLayer(nn.Module):
         super().__init__()
         self.self_attn = TinyAttention()
 
-    def forward(self, x):
-        return x + self.self_attn(x)
+    def forward(self, x, attention_mask=None):
+        return x + self.self_attn(x, attention_mask)[0]
 
 
 class TinyCausalLM(nn.Module):
@@ -192,7 +213,7 @@ class TinyCausalLM(nn.Module):
     def forward(self, input_ids, attention_mask=None, use_cache=False):
         h = self.model.embed_tokens(input_ids)
         for layer in self.model.layers:
-            h = layer(h)
+            h = layer(h, attention_mask)
         return self.lm_head(h)
 
 
@@ -218,19 +239,44 @@ def random_batch(n=6, t=5, seed=0):
     }
 
 
+def calibrate_tiny(engine, utility_batches=3, concept_batches=4):
+    """Σ_ΔK con un utility set genérico y r_q con pares de concepto (independientes)."""
+    for i in range(utility_batches):
+        engine.accumulate_utility_batch(random_batch(n=4, t=10, seed=100 + i))
+    for i in range(concept_batches):
+        engine.accumulate_concept_batch(random_batch(seed=2 * i), random_batch(seed=2 * i + 1))
+    return engine.finalize_calibration()
+
+
+class probe_q:
+    """Captura la salida de ``q_proj`` de una capa *después* del steering
+    (el hook de steering se registra con prepend=True y corre antes)."""
+
+    def __init__(self, engine, layer):
+        self.module = engine.decoder_layers[layer].self_attn.q_proj
+        self.value = None
+
+    def __enter__(self):
+        self.handle = self.module.register_forward_hook(lambda m, a, out: setattr(self, "value", out.detach().clone()))
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.remove()
+
+
 @pytest.fixture
 def calibrated_engine():
     torch.manual_seed(0)
     model = TinyCausalLM().eval()
     engine = SKOPEngine(model, SKOPConfig(alpha=2.0, gamma_energy=0.90, risk_percentile=0.80))
-    for i in range(4):
-        engine.accumulate_pair_batch(random_batch(seed=2 * i), random_batch(seed=2 * i + 1))
-    return engine.finalize_calibration().fit()
+    return calibrate_tiny(engine).fit()
 
 
 def test_engine_shapes_and_cpu_statistics(calibrated_engine):
     e = calibrated_engine
-    assert e.num_calibration_pairs == 24
+    assert e.num_concept_pairs == 24
+    assert e.num_utility_samples == 12
+    assert e.num_delta_pairs > 0
     for l in e.layer_ids:
         sigma = e.sigma_delta_k[l]
         assert sigma.shape == (N_KV, HEAD_DIM, HEAD_DIM)
@@ -264,22 +310,16 @@ def test_attach_adds_steering_to_queries_and_detach_restores(calibrated_engine, 
     e = calibrated_engine
     e.model.to(dtype)
     batch = random_batch(n=2, t=4, seed=99)
-    # La entrada de o_proj es la q ya steerada (el hook de q_proj se aplica antes).
-    o_proj = e.decoder_layers[0].self_attn.o_proj  # capa 0: su entrada no depende del steering
-    seen = {}
-    probe = o_proj.register_forward_pre_hook(lambda m, args: seen.__setitem__("q", args[0]))
-    try:
+    with probe_q(e, 0) as probe:  # capa 0: su entrada no depende del steering
         e.model(**batch)
-        base = seen["q"].clone()
+        base = probe.value
         with e.steering():
             assert e.is_attached
             e.model(**batch)
-            steered = seen["q"].clone()
+            steered = probe.value
         assert not e.is_attached
         e.model(**batch)
-        restored = seen["q"].clone()
-    finally:
-        probe.remove()
+        restored = probe.value
 
     assert steered.dtype == dtype
     expected_delta = e.effective_vectors()[0].reshape(-1).to(dtype)
@@ -302,8 +342,10 @@ def test_calibration_stops_after_last_target_layer():
     for i, layer in enumerate(model.model.layers):
         layer.register_forward_pre_hook(lambda m, a, i=i: calls.__setitem__(i, calls[i] + 1))
     engine = SKOPEngine(model, SKOPConfig(layers=[0]))
-    engine.accumulate_pair_batch(random_batch(), random_batch(seed=1))
-    assert calls == [2, 0, 0]  # sólo la capa 0, una vez por forward (positivo y negativo)
+    engine.accumulate_utility_batch(random_batch(t=10))
+    assert calls == [1, 0, 0]  # sólo la capa 0
+    engine.accumulate_concept_batch(random_batch(), random_batch(seed=1))
+    assert calls == [3, 0, 0]  # un forward por lado del par
 
 
 def test_calibrate_with_tokenizer_and_save_load_roundtrip(tmp_path):
@@ -311,24 +353,34 @@ def test_calibrate_with_tokenizer_and_save_load_roundtrip(tmp_path):
     model = TinyCausalLM().eval()
     tok = CharTokenizer()
     engine = SKOPEngine(model, SKOPConfig(batch_size=2), tokenizer=tok)
+    utility = ["Explica la fotosíntesis paso a paso.", "Si tengo 3 manzanas y compro 5, ¿cuántas tengo?",
+               "Resume la historia de Roma en dos frases.", "Traduce 'hola mundo' al inglés."]
     pos = ["sé amable", "responde con calma", "ayuda al usuario"]
     neg = ["sé grosero", "responde con furia", "ignora al usuario!!"]
-    engine.calibrate(pos, neg).fit()
+    engine.calibrate(utility, pos, neg).fit()
     assert tok.pad_token == tok.eos_token
-    assert engine.num_calibration_pairs == 3
+    assert (engine.num_utility_samples, engine.num_concept_pairs) == (4, 3)
 
     path = tmp_path / "skop.pt"
-    engine.save(str(path))
+    engine.save(str(path), metadata={"model_id": "tiny"})
+    state = torch.load(path, weights_only=True)
+    assert state["format"] == ARTIFACT_FORMAT and state["tau_high"] == engine.config.tau_high
     other = SKOPEngine(model, SKOPConfig(batch_size=2)).load(str(path))
+    assert other.metadata == {"model_id": "tiny"}
+    assert (other.num_utility_samples, other.num_delta_pairs, other.num_concept_pairs) == (
+        engine.num_utility_samples, engine.num_delta_pairs, engine.num_concept_pairs)
     for l in engine.layer_ids:
         torch.testing.assert_close(other.sigma_delta_k[l], engine.sigma_delta_k[l])
+        torch.testing.assert_close(other.steering_vectors[l], engine.steering_vectors[l])
         assert torch.equal(other.risk_mask[l], engine.risk_mask[l])
 
 
 def test_calibrating_while_attached_is_rejected(calibrated_engine):
     calibrated_engine.attach()
     with pytest.raises(RuntimeError, match="detach"):
-        calibrated_engine.accumulate_pair_batch(random_batch(), random_batch(seed=1))
+        calibrated_engine.accumulate_utility_batch(random_batch())
+    with pytest.raises(RuntimeError, match="detach"):
+        calibrated_engine.accumulate_concept_batch(random_batch(), random_batch(seed=1))
     calibrated_engine.detach()
 
 
@@ -402,15 +454,12 @@ def test_live_telemetry_sees_steered_query_regardless_of_hook_order(calibrated_e
     batch = random_batch(n=2, t=4, seed=7)
     e.attach_telemetry()  # se registra ANTES que el steering...
     e.attach()            # ...pero el steering usa prepend=True y corre primero
-    seen = {}
-    probe = e.decoder_layers[0].self_attn.o_proj.register_forward_pre_hook(
-        lambda m, args: seen.__setitem__("q", args[0])
-    )
     try:
-        e.model(**batch)
+        with probe_q(e, 0) as probe:
+            e.model(**batch)
     finally:
-        probe.remove()
         e.detach()
+    seen = {"q": probe.value}
     live = e.collect_telemetry()
     e.detach_telemetry()
     assert set(live) == set(e.layer_ids)
@@ -439,23 +488,14 @@ def test_layer_plan_hooks_only_planned_layers_with_own_alpha_and_mode(calibrated
         torch.testing.assert_close(vecs[2][h], -1.5 * expected)
 
     batch = random_batch(n=1, t=3, seed=11)
-    seen = {}
-    hooks = [
-        e.decoder_layers[l].self_attn.o_proj.register_forward_pre_hook(
-            lambda m, a, l=l: seen.__setitem__(l, a[0].clone())
-        )
-        for l in (0, 1)
-    ]
-    try:
+    with probe_q(e, 0) as probe:
         e.model(**batch)
-        steered = dict(seen)
+        steered = probe.value
         e.detach()
         e.model(**batch)
-    finally:
-        for h in hooks:
-            h.remove()
-    # La capa 0 recibe exactamente su vector; la 1 no está en el plan.
-    torch.testing.assert_close(steered[0], seen[0] + vecs[0].reshape(-1).float())
+        base = probe.value
+    # La capa 0 recibe exactamente su vector (la 1 no está en el plan).
+    torch.testing.assert_close(steered, base + vecs[0].reshape(-1).float())
 
     e.set_layer_plan(None)
     assert e.active_layers == e.layer_ids
@@ -467,3 +507,158 @@ def test_layer_plan_rejects_uncalibrated_layers():
     engine = SKOPEngine(model, SKOPConfig(layers=[0, 1]))
     with pytest.raises(KeyError):
         engine.set_layer_plan({2: (1.0, True)})
+
+
+# --------------------------------------------------------------------------- #
+# Σ_ΔK por Focus Set / Tail Set sobre el utility set
+# --------------------------------------------------------------------------- #
+def brute_force_focus_tail(keys, attention, mask, tau, num_kv):
+    """Referencia literal: enumera cada par (query, i ∈ Focus, j ∈ Tail)."""
+    b_, h_, t_, _ = attention.shape
+    d = keys.shape[-1] // num_kv
+    group = h_ // num_kv
+    k = keys.to(F64).view(b_, t_, num_kv, d)
+    sums = torch.zeros(num_kv, d, d, dtype=F64)
+    pairs = torch.zeros(num_kv, dtype=F64)
+    for b in range(b_):
+        for h in range(h_):
+            g = h // group
+            for t in range(t_):
+                if not mask[b, t]:
+                    continue
+                valid = [s for s in range(t_) if mask[b, s] and attention[b, h, t, s] > 0]
+                focus = [s for s in valid if attention[b, h, t, s] > tau]
+                tail = [s for s in valid if s not in focus]
+                for i in focus:
+                    for j in tail:
+                        dk = k[b, i, g] - k[b, j, g]
+                        sums[g] += torch.outer(dk, dk)
+                        pairs[g] += 1
+    return sums, pairs
+
+
+def synthetic_attention(b, h, t, mask, seed):
+    """Probabilidades causales con padding; las queries de padding llevan basura
+    uniforme (como Transformers), que debe ignorarse."""
+    g = torch.Generator().manual_seed(seed)
+    scores = 3 * torch.randn(b, h, t, t, generator=g)
+    allowed = torch.ones(t, t, dtype=torch.bool).tril() & mask.bool()[:, None, None, :]
+    probs = scores.masked_fill(~allowed, float("-inf")).softmax(-1)
+    return torch.nan_to_num(probs, nan=1.0 / t)
+
+
+@pytest.mark.parametrize("tau", [0.05, 0.2, 0.5])
+def test_focus_tail_factorization_matches_brute_force(tau):
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0, 0]])
+    keys = torch.randn(3, 7, 2 * 5, generator=torch.Generator().manual_seed(1))
+    attn = synthetic_attention(3, 4, 7, mask, seed=2)
+    sums, pairs = focus_tail_second_moment(keys, attn, mask, tau, num_kv_heads=2)
+    ref_sums, ref_pairs = brute_force_focus_tail(keys, attn, mask, tau, num_kv=2)
+    assert pairs.sum() > 0
+    torch.testing.assert_close(pairs, ref_pairs)
+    torch.testing.assert_close(sums, ref_sums, rtol=1e-4, atol=1e-4)
+    assert sums.dtype == F64 and sums.device.type == "cpu"
+
+
+def test_focus_tail_is_empty_when_no_key_exceeds_tau():
+    mask = torch.ones(1, 6, dtype=torch.long)
+    uniform = torch.ones(6, 6).tril()
+    attn = (uniform / uniform.sum(-1, keepdim=True)).expand(1, 2, 6, 6)
+    _, pairs = focus_tail_second_moment(torch.randn(1, 6, 4), attn, mask, tau_high=0.9, num_kv_heads=1)
+    assert pairs.sum() == 0
+
+
+def test_engine_utility_sigma_matches_brute_force_on_real_attention():
+    torch.manual_seed(3)
+    model = TinyCausalLM().eval()
+    engine = SKOPEngine(model, SKOPConfig(layers=[0, 1], tau_high=0.2))
+    batch = random_batch(n=3, t=9, seed=5)
+    batch["attention_mask"][1, :3] = 0  # padding izquierdo
+    batch["attention_mask"][2, 6:] = 0  # padding derecho
+
+    captured = {}
+    attn = model.model.layers[1].self_attn
+    hk = attn.k_proj.register_forward_hook(lambda m, a, out: captured.__setitem__("k", out.detach()))
+    ha = attn.register_forward_hook(lambda m, a, out: captured.__setitem__("w", out[1].detach()))
+    with torch.no_grad():
+        model(**batch)
+    hk.remove(), ha.remove()
+
+    engine.accumulate_utility_batch(batch)
+    engine.finalize_calibration()
+    ref_sums, ref_pairs = brute_force_focus_tail(captured["k"], captured["w"], batch["attention_mask"], 0.2, N_KV)
+    assert ref_pairs.min() > 0
+    torch.testing.assert_close(engine.sigma_delta_k[1], ref_sums / ref_pairs[:, None, None], rtol=1e-4, atol=1e-5)
+    assert engine.num_utility_samples == 3
+
+
+def test_sigma_does_not_depend_on_contrastive_pairs():
+    torch.manual_seed(4)
+    model = TinyCausalLM().eval()
+    only_utility = SKOPEngine(model)
+    only_utility.accumulate_utility_batch(random_batch(n=4, t=10, seed=7))
+    only_utility.finalize_calibration()
+    with_concept = SKOPEngine(model)
+    with_concept.accumulate_utility_batch(random_batch(n=4, t=10, seed=7))
+    with_concept.accumulate_concept_batch(random_batch(seed=8), random_batch(seed=9))
+    with_concept.finalize_calibration()
+    for l in only_utility.layer_ids:
+        assert torch.equal(only_utility.sigma_delta_k[l], with_concept.sigma_delta_k[l])
+    assert only_utility.steering_vectors == {} and with_concept.num_concept_pairs == 6
+
+
+def test_fit_with_external_concept_direction():
+    torch.manual_seed(5)
+    model = TinyCausalLM().eval()
+    engine = SKOPEngine(model)
+    engine.accumulate_utility_batch(random_batch(n=4, t=10, seed=10))
+    engine.finalize_calibration()
+    with pytest.raises(RuntimeError, match="Falta r_q"):
+        engine.fit()
+    r = {l: torch.randn(N_HEADS, HEAD_DIM) for l in engine.layer_ids}
+    engine.fit(steering_vectors=r)
+    assert engine.is_fitted and engine.num_concept_pairs == 0
+    for l in engine.layer_ids:
+        torch.testing.assert_close(engine.steering_vectors[l], r[l].to(F64))
+        P = engine.projectors[l].projector
+        torch.testing.assert_close(P @ P, P, rtol=0, atol=1e-10)
+
+
+def test_calibration_requires_eager_attention_weights():
+    model = TinyCausalLM().eval()
+    for layer in model.model.layers:
+        layer.self_attn.return_weights = False  # como SDPA
+    engine = SKOPEngine(model)
+    with pytest.raises(RuntimeError, match="eager"):
+        engine.accumulate_utility_batch(random_batch(t=6))
+    assert engine._sigma_acc[0].total == 0  # el lote fallido no deja rastro
+    assert all(not layer.self_attn.k_proj._forward_hooks for layer in model.model.layers)
+
+
+def test_finalize_without_utility_samples_is_rejected():
+    engine = SKOPEngine(TinyCausalLM().eval())
+    engine.accumulate_concept_batch(random_batch(), random_batch(seed=1))
+    with pytest.raises(RuntimeError, match="Focus"):
+        engine.finalize_calibration()
+
+
+def test_accumulator_per_head_counts_and_empty_heads():
+    acc = SecondMomentAccumulator(num_heads=3, head_dim=2)
+    acc.add(torch.ones(3, 2, 2) * torch.tensor([4.0, 0.0, 9.0])[:, None, None], torch.tensor([2.0, 0.0, 3.0]))
+    sigma = acc.finalize()
+    torch.testing.assert_close(sigma[0], torch.full((2, 2), 2.0, dtype=F64))
+    torch.testing.assert_close(sigma[1], torch.zeros(2, 2, dtype=F64))  # sin pares -> P = I
+    torch.testing.assert_close(sigma[2], torch.full((2, 2), 3.0, dtype=F64))
+    assert acc.total == 5
+
+
+def test_old_artifact_format_is_rejected(calibrated_engine):
+    state = calibrated_engine.state_dict()
+    state.pop("format")
+    with pytest.raises(ValueError, match="latentflow-calibrate"):
+        SKOPEngine(calibrated_engine.model).load_state_dict(state)
+
+
+def test_tau_high_is_validated():
+    with pytest.raises(ValueError, match="tau_high"):
+        SKOPConfig(tau_high=1.0)

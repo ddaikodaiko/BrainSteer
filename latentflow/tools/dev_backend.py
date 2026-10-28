@@ -16,6 +16,10 @@ Uso::
 El texto generado es ruido (los pesos son aleatorios). La geometría por defecto
 reproduce el número de capas y de cabezas de query de Gemma-2-2B (26 × 8); el
 resto de dimensiones está reducido para que corra en CPU.
+
+Sin calibración externa, el SKOPEngine se calibra con ruido: Σ_ΔK con secuencias
+aleatorias (utility set) y ``r_q`` con pares aleatorios. Con
+``LATENTFLOW_CALIBRATION`` carga un artefacto de ``latentflow-calibrate --dev``.
 """
 
 from __future__ import annotations
@@ -34,7 +38,15 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from latentflow.api.server import InferenceRuntime, ServerSettings, create_app
 from latentflow.core.steering import SKOPConfig, SKOPEngine
 
-__all__ = ["CharTokenizer", "DevModelSpec", "build_dev_runtime", "dev_runtime_factory", "create_dev_app", "main"]
+__all__ = [
+    "CharTokenizer",
+    "DevModelSpec",
+    "build_dev_model",
+    "build_dev_runtime",
+    "dev_runtime_factory",
+    "create_dev_app",
+    "main",
+]
 
 logger = logging.getLogger("latentflow.dev")
 
@@ -89,13 +101,16 @@ class DevModelSpec:
     hidden_size: int = 128
     intermediate_size: int = 256
     vocab_size: int = 100
+    # Con la inicialización por defecto (0.02) la atención de un modelo aleatorio es
+    # casi uniforme y ninguna key supera tau_high: no habría pares Focus × Tail.
+    initializer_range: float = 0.1
     # Retardo por forward (s): simula la latencia de un modelo real para que el
     # streaming y los hot-swaps a mitad de generación sean observables en la UI.
     delay: float = 0.04
     calibrated: bool = True
     calibration_batches: int = 6
     calibration_batch_size: int = 4
-    calibration_seq_len: int = 8
+    calibration_seq_len: int = 16
     seed: int = 0
 
     @property
@@ -103,8 +118,8 @@ class DevModelSpec:
         return f"dev/tiny-llama-{self.num_layers}L (pesos aleatorios)"
 
 
-def build_dev_runtime(settings: ServerSettings, spec: DevModelSpec = DevModelSpec()) -> InferenceRuntime:
-    """Modelo tiny + tokenizer de caracteres + SKOPEngine calibrado con ruido."""
+def build_dev_model(spec: DevModelSpec = DevModelSpec()):
+    """Llama tiny con pesos aleatorios y atención eager (necesaria para Σ_ΔK)."""
     torch.manual_seed(spec.seed)
     config = LlamaConfig(
         vocab_size=spec.vocab_size,
@@ -114,19 +129,32 @@ def build_dev_runtime(settings: ServerSettings, spec: DevModelSpec = DevModelSpe
         num_attention_heads=spec.num_heads,
         num_key_value_heads=spec.num_kv_heads,
         head_dim=spec.head_dim,
+        initializer_range=spec.initializer_range,
         pad_token_id=CharTokenizer.pad_token_id,
         bos_token_id=CharTokenizer.bos_token_id,
         eos_token_id=CharTokenizer.eos_token_id,
+        attn_implementation="eager",
     )
     model = LlamaForCausalLM(config).eval()
     # Sin EOS: la longitud de cada generación la decide sólo `max_new_tokens`.
     model.generation_config.eos_token_id = None
     if spec.delay > 0:
         model.register_forward_pre_hook(lambda module, args: time.sleep(spec.delay))
+    return model, CharTokenizer(spec.vocab_size)
 
-    tokenizer = CharTokenizer(spec.vocab_size)
+
+def build_dev_runtime(settings: ServerSettings, spec: DevModelSpec = DevModelSpec()) -> InferenceRuntime:
+    """Modelo tiny + tokenizer de caracteres + SKOPEngine calibrado.
+
+    Si ``settings.calibration_path`` está definido se carga ese artefacto; si no,
+    y ``spec.calibrated``, se calibra con ruido.
+    """
+    model, tokenizer = build_dev_model(spec)
     engine = SKOPEngine(model, SKOPConfig(alpha=settings.alpha), tokenizer=tokenizer)
-    if spec.calibrated:
+    if settings.calibration_path:
+        logger.info("Cargando calibración SKOP de %s", settings.calibration_path)
+        engine.load(settings.calibration_path)
+    elif spec.calibrated:
         g = torch.Generator().manual_seed(spec.seed + 1)
         shape = (spec.calibration_batch_size, spec.calibration_seq_len)
 
@@ -137,7 +165,8 @@ def build_dev_runtime(settings: ServerSettings, spec: DevModelSpec = DevModelSpe
             }
 
         for _ in range(spec.calibration_batches):
-            engine.accumulate_pair_batch(batch(), batch())
+            engine.accumulate_utility_batch(batch())  # Σ_ΔK: utility set (ruido)
+            engine.accumulate_concept_batch(batch(), batch())  # r_q: pares de concepto (ruido)
         engine.finalize_calibration().fit()
     return InferenceRuntime(model, tokenizer, engine, settings)
 
@@ -148,9 +177,9 @@ def dev_runtime_factory(spec: DevModelSpec = DevModelSpec()) -> Callable[[Server
 
 def create_dev_app(spec: DevModelSpec = DevModelSpec(), settings: Optional[ServerSettings] = None) -> FastAPI:
     """App FastAPI real sobre el modelo tiny. Hereda de las variables de entorno
-    la configuración de seguridad (``LATENTFLOW_ALLOWED_ORIGINS``...)."""
+    la seguridad (``LATENTFLOW_ALLOWED_ORIGINS``...) y ``LATENTFLOW_CALIBRATION``."""
     settings = settings or ServerSettings.from_env()
-    settings = dataclasses.replace(settings, model_id=spec.label, load_in_4bit=False, calibration_path=None)
+    settings = dataclasses.replace(settings, model_id=spec.label, load_in_4bit=False)
     return create_app(settings, dev_runtime_factory(spec))
 
 

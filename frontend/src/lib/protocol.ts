@@ -114,7 +114,8 @@ export type ClientMessage =
   | GenerateMessage
   | UpdateCircuitMessage
   | { action: typeof ClientAction.CANCEL }
-  | { action: typeof ClientAction.CALIBRATE; positive: string[]; negative: string[] }
+  /** `utility` estima Σ_ΔK (Focus/Tail); `positive`/`negative`, la dirección r_q. */
+  | { action: typeof ClientAction.CALIBRATE; utility: string[]; positive: string[]; negative: string[] }
   | { action: typeof ClientAction.STATUS }
   | { action: typeof ClientAction.PING }
 
@@ -171,6 +172,7 @@ export interface CircuitEvent {
 export interface CalibratedEvent {
   type: typeof ServerEvent.CALIBRATED
   num_pairs: number
+  num_utility: number
   circuit: CircuitSnapshot
 }
 export interface StatusEvent {
