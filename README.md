@@ -128,38 +128,50 @@ hf auth login
 
 Cada feature de Neuronpedia indica su SAE. Por ejemplo,
 `gemma-2-2b/20-gemmascope-res-16k/12082` es la feature 12082 del SAE **residual**
-de la **capa 20**, ancho **16k**. Descarga sólo las capas que vayas a usar:
+de la **capa 20**, ancho **16k**. En Hugging Face, ese SAE está en el repo
+`google/gemma-scope-2b-pt-res`, en la carpeta del L0 que Neuronpedia usa como
+*canonical*: `layer_20/width_16k/average_l0_71`. Descarga sólo las capas que vayas
+a usar:
 
 ```bash
-export LATENTFLOW_SAE_DIR="$HOME/brainsteer/sae"
-hf download google/gemma-scope-2b-pt-res-canonical \
-    --include "layer_20/width_16k/canonical/*" \
-    --local-dir "$LATENTFLOW_SAE_DIR/gemma-scope-2b-pt-res-canonical"
+hf download google/gemma-scope-2b-pt-res --include "layer_20/width_16k/average_l0_71/*"
 ```
 
-El resolvedor espera este árbol (el de Gemma Scope):
+El fichero queda en la caché de Hugging Face y el resolvedor lo encuentra ahí, sin
+red. Cada capa tiene su propio L0 canonical; para saber qué descargar para otra
+feature, pregúntale al resolvedor:
 
-```text
-$LATENTFLOW_SAE_DIR/
-└── gemma-scope-2b-pt-res-canonical/
-    └── layer_20/
-        └── width_16k/
-            └── canonical/
-                └── params.npz        # contiene W_dec (16384 × 2304)
+```bash
+python -c "from latentflow.core.sae import FeatureRef; print(FeatureRef.parse('gemma-2-2b/6-gemmascope-res-16k/0').hf_location)"
+# ('google/gemma-scope-2b-pt-res', 'layer_6/width_16k/average_l0_70')
 ```
 
-- **Sin `--local-dir`**, el fichero queda en la caché de Hugging Face y el
-  resolvedor también lo encuentra, sin red.
-- **Para SAEs de MLP**, usa `google/gemma-scope-2b-pt-mlp-canonical`.
+La tabla completa (Gemma-2 2B, 9B y 27B; residual y MLP) está en
+[`latentflow/core/gemma_scope_canonical.py`](latentflow/core/gemma_scope_canonical.py),
+generada a partir del catálogo de SAELens. Si una feature no se encuentra, el error
+incluye el comando `hf download` exacto.
+
+- **Si prefieres una carpeta propia**, descarga con
+  `--local-dir "$LATENTFLOW_SAE_DIR/gemma-scope-2b-pt-res"` y define
+  `LATENTFLOW_SAE_DIR`. El resolvedor espera el árbol del repo:
+
+  ```text
+  $LATENTFLOW_SAE_DIR/
+  └── gemma-scope-2b-pt-res/
+      └── layer_20/
+          └── width_16k/
+              └── average_l0_71/
+                  └── params.npz        # contiene W_dec (16384 × 2304)
+  ```
+
+- **Para SAEs de MLP**, el repo es `google/gemma-scope-2b-pt-mlp`.
 - **Los SAEs de atención (`att`) no sirven:** su decoder no vive en el residual stream.
 
 Comprueba la resolución antes de arrancar nada:
 
 ```bash
-python -c "from latentflow.core.sae import GemmaScopeResolver as R; \
-f = R('$LATENTFLOW_SAE_DIR').resolve('gemma-2-2b/20-gemmascope-res-16k/12082', 2304); \
-print(f.source, tuple(f.vector.shape))"
-# gemma-scope:/.../layer_20/width_16k/canonical/params.npz (2304,)
+python -c "from latentflow.core.sae import GemmaScopeResolver as R; f = R().resolve('gemma-2-2b/20-gemmascope-res-16k/12082', 2304); print(f.source, tuple(f.vector.shape))"
+# gemma-scope:/.../layer_20/width_16k/average_l0_71/params.npz (2304,)
 ```
 
 ### 4. Preparar los datos de calibración
@@ -236,7 +248,8 @@ La cabecera debe mostrar **SAE: Gemma Scope local**.
 
 | Síntoma | Causa y solución |
 | --- | --- |
-| `feature_not_found` | No hay `params.npz` para ese SAE. Revisa `LATENTFLOW_SAE_DIR` y el árbol del paso 3; el mensaje incluye las rutas buscadas |
+| `feature_not_found` | No hay `params.npz` para ese SAE. El mensaje incluye las rutas buscadas y el comando `hf download` exacto (paso 3) |
+| `hf download`: `Model 'google/gemma-scope-…-canonical' not found` | Ese repo no existe: *canonical* es el nombre de la release en SAELens. Usa `google/gemma-scope-2b-pt-res` (paso 3) |
 | `feature_invalid … d_model` | El SAE es de otro modelo (p. ej. Gemma-2-9B) |
 | Nodo en rojo: `error: att no soportado` | SAE de atención; usa una feature `res` o `mlp` |
 | Error de calibración que menciona `eager` | El modelo se cargó con SDPA/Flash; `latentflow-calibrate` ya fuerza `eager`, no lo sobrescribas |

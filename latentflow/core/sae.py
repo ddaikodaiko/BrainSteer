@@ -10,21 +10,24 @@ fila 12082 de ``W_dec`` del SAE residual (``res``) de la capa 20, ancho 16k. Ese
 vector vive en el residual stream (``d_model``), no en el espacio de queries: el
 ``SKOPEngine`` lo mapea con ``residual_to_query()`` antes de usarlo como ``r_q``.
 
+El SAE que Neuronpedia llama ``gemma-2-2b/20-gemmascope-res-16k`` vive en Hugging Face
+en el repo ``google/gemma-scope-2b-pt-res``, carpeta ``layer_20/width_16k/average_l0_71``
+(el L0 *canonical*; ver ``gemma_scope_canonical.CANONICAL_SAES``).
+
 Orden de búsqueda de ``GemmaScopeResolver`` (``root`` = ``LATENTFLOW_SAE_DIR``):
 
 1. Fichero estructurado: ``<root>/<modelo>/<sae_id>.{safetensors,npz,pt}`` o
    ``<root>/<modelo>/<sae_id>/params.{safetensors,npz}``, con una matriz ``W_dec``
    en cualquier orientación ((d_sae, d_model) como Gemma Scope, o (d_model, d_sae)).
-2. Árbol de Gemma Scope bajo ``root``:
-   ``[<root>/gemma-scope-2b-pt-res-canonical/]layer_20/width_16k/canonical/params.npz``
-   (o un único ``average_l0_*``).
+2. Árbol de Gemma Scope bajo ``root`` (con o sin la carpeta del repo):
+   ``[<root>/gemma-scope-2b-pt-res/]layer_20/width_16k/average_l0_71/params.npz``,
+   o un único ``average_l0_*`` si el SAE no está en la tabla.
 3. Caché local de Hugging Face (``huggingface_hub.try_to_load_from_cache``, sin
-   red) del repo ``google/gemma-scope-<tamaño>-pt-<sitio>-canonical``.
+   red) de ese mismo fichero.
 
-Para poblarla en una máquina con red::
+Para poblar la caché en una máquina con red::
 
-    hf download google/gemma-scope-2b-pt-res-canonical \\
-        --include "layer_20/width_16k/canonical/*"
+    hf download google/gemma-scope-2b-pt-res --include "layer_20/width_16k/average_l0_71/*"
 
 ``HashFeatureResolver`` (dev backend) genera un vector pseudoaleatorio determinista
 a partir del sha256 del ID: el mismo ID da el mismo vector en cualquier proceso
@@ -40,10 +43,12 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import torch
 from torch import Tensor
+
+from latentflow.core.gemma_scope_canonical import CANONICAL_SAES
 
 __all__ = [
     "FeatureError",
@@ -99,6 +104,11 @@ class FeatureRef:
         if m:
             return cls(raw, m["model"], m["sae"], int(m["index"]))
         raise FeatureError(f"Feature ID '{feature_id}' no tiene la forma modelo/sae/índice")
+
+    @property
+    def hf_location(self) -> Optional[Tuple[str, str]]:
+        """``(repo, carpeta)`` del SAE canonical en Hugging Face, si está en la tabla."""
+        return CANONICAL_SAES.get(f"{self.model}/{self.sae_id}")
 
     @property
     def model_size(self) -> Optional[str]:
@@ -192,10 +202,17 @@ class GemmaScopeResolver:
             base = self.root / ref.model
             out += [base / f"{ref.sae_id}{ext}" for ext in (".safetensors", ".npz", ".pt")]
             out += [base / ref.sae_id / f"params{ext}" for ext in (".safetensors", ".npz")]
-            if ref.layer is not None and ref.model_size:
+            if ref.layer is not None:
+                location = ref.hf_location
                 rel = Path(f"layer_{ref.layer}") / f"width_{ref.width}"
-                for tree in (self.root / f"gemma-scope-{ref.model_size}-pt-{ref.site}-canonical", self.root):
-                    out.append(tree / rel / "canonical" / "params.npz")
+                trees = [self.root / location[0].split("/")[-1]] if location else []
+                if ref.model_size:
+                    trees.append(self.root / f"gemma-scope-{ref.model_size}-pt-{ref.site}-canonical")  # v0.1
+                trees.append(self.root)
+                for tree in trees:
+                    if location:
+                        out.append(tree / location[1] / "params.npz")
+                    out.append(tree / rel / "canonical" / "params.npz")  # árbol de v0.1
                     variants = sorted((tree / rel).glob("average_l0_*/params.npz"))
                     if len(variants) == 1:
                         out.append(variants[0])
@@ -209,21 +226,20 @@ class GemmaScopeResolver:
         for path in candidates:
             if path.is_file():
                 return path
-        hf_target = None
-        if self.use_hf_cache and ref.layer is not None and ref.model_size:
-            repo = f"google/gemma-scope-{ref.model_size}-pt-{ref.site}-canonical"
-            filename = f"layer_{ref.layer}/width_{ref.width}/canonical/params.npz"
-            hf_target = f"{repo}:{filename}"
+        location = ref.hf_location
+        if self.use_hf_cache and location:
             try:
                 from huggingface_hub import try_to_load_from_cache
 
-                cached = try_to_load_from_cache(repo, filename, cache_dir=self.hf_cache_dir)
+                cached = try_to_load_from_cache(location[0], f"{location[1]}/params.npz", cache_dir=self.hf_cache_dir)
                 if isinstance(cached, str):
                     return Path(cached)
             except ImportError:
                 pass
-        searched = [str(p) for p in candidates] + ([f"caché HF {hf_target}"] if hf_target else [])
-        hint = f" Descarga: hf download {hf_target.split(':')[0]} --include \"{hf_target.split(':')[1].rsplit('/', 1)[0]}/*\"" if hf_target else ""
+        searched = [str(p) for p in candidates]
+        if self.use_hf_cache and location:
+            searched.append(f"caché HF {location[0]}:{location[1]}/params.npz")
+        hint = f" Descarga: hf download {location[0]} --include \"{location[1]}/*\"" if location else ""
         where = "; ".join(searched) if searched else "define LATENTFLOW_SAE_DIR"
         raise FeatureNotFoundError(f"{ref.raw}: no hay pesos locales del SAE '{ref.sae_id}' (buscado en: {where}).{hint}")
 

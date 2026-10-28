@@ -728,7 +728,7 @@ def test_gemma_scope_weights_are_read_from_local_disk(client, tmp_path):
         assert ws.receive_json()["code"] == "feature_invalid"
         assert runtime.circuit.version == version  # nada aplicado
 
-        sae_dir = tmp_path / "gemma-scope-2b-pt-res-canonical" / "layer_0" / "width_16k" / "canonical"
+        sae_dir = tmp_path / "gemma-scope-2b-pt-res" / "layer_0" / "width_16k" / "average_l0_105"  # canonical de la capa 0
         sae_dir.mkdir(parents=True)
         w_dec = np.random.default_rng(0).standard_normal((20000, HIDDEN_TEST)).astype(np.float32)
         np.savez(sae_dir / "params.npz", W_dec=w_dec)

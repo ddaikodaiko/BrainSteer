@@ -1,5 +1,6 @@
 """Resolución de features de SAE (Gemma Scope) sin red."""
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+from latentflow.core.gemma_scope_canonical import CANONICAL_SAES
 from latentflow.core.sae import (
     FeatureError,
     FeatureNotFoundError,
@@ -83,18 +85,40 @@ def test_hash_resolver_is_deterministic_across_processes():
         resolver.resolve("  ", 32)
 
 
+CANONICAL_20 = Path("layer_20") / "width_16k" / "average_l0_71"  # gemma-2-2b/20-gemmascope-res-16k
+
+
+def test_canonical_table_matches_hugging_face_layout():
+    """Los repos `-canonical` no existen en Hugging Face: el SAE canonical es una
+    carpeta `average_l0_*` del repo `google/gemma-scope-<tamaño>-pt-<sitio>`."""
+    assert FeatureRef.parse(FID).hf_location == ("google/gemma-scope-2b-pt-res", CANONICAL_20.as_posix())
+    assert len(CANONICAL_SAES) > 250
+    for np_id, (repo, folder) in CANONICAL_SAES.items():
+        ref = FeatureRef.parse(f"{np_id}/0")
+        assert ref.site in ("res", "mlp") and repo.startswith("google/gemma-scope-") and not repo.endswith("-canonical")
+        assert repo.endswith(f"-{ref.site}") and folder.startswith(f"layer_{ref.layer}/width_{ref.width}/average_l0_")
+
+
 def test_gemma_scope_tree_npz(tmp_path):
     matrix = w_dec()
-    save_npz(tmp_path / "gemma-scope-2b-pt-res-canonical" / "layer_20" / "width_16k" / "canonical" / "params.npz", matrix)
+    save_npz(tmp_path / "gemma-scope-2b-pt-res" / CANONICAL_20 / "params.npz", matrix)
+    save_npz(tmp_path / "gemma-scope-2b-pt-res" / "layer_20" / "width_16k" / "average_l0_20" / "params.npz", w_dec(9))
     resolved = GemmaScopeResolver(str(tmp_path), use_hf_cache=False).resolve(FID, D_MODEL)
-    torch.testing.assert_close(resolved.vector, matrix[7])
+    torch.testing.assert_close(resolved.vector, matrix[7])  # el canonical, no otro L0
     assert resolved.source.startswith("gemma-scope:") and resolved.layer == 20
 
 
-def test_single_average_l0_variant_is_used(tmp_path):
-    matrix = w_dec(1)
-    save_npz(tmp_path / "layer_20" / "width_16k" / "average_l0_71" / "params.npz", matrix)
+def test_v01_canonical_tree_is_still_found(tmp_path):
+    matrix = w_dec(4)
+    save_npz(tmp_path / "gemma-scope-2b-pt-res-canonical" / "layer_20" / "width_16k" / "canonical" / "params.npz", matrix)
     torch.testing.assert_close(GemmaScopeResolver(str(tmp_path), use_hf_cache=False).resolve(FID, D_MODEL).vector, matrix[7])
+
+
+def test_single_average_l0_variant_is_used_outside_the_table(tmp_path):
+    matrix = w_dec(1)
+    save_npz(tmp_path / "layer_20" / "width_32k" / "average_l0_33" / "params.npz", matrix)
+    resolver = GemmaScopeResolver(str(tmp_path), use_hf_cache=False)
+    torch.testing.assert_close(resolver.resolve("gemma-2-2b/20-gemmascope-res-32k/7", D_MODEL).vector, matrix[7])
 
 
 def test_structured_files_in_both_orientations(tmp_path):
@@ -112,18 +136,20 @@ def test_structured_files_in_both_orientations(tmp_path):
 
 
 def test_local_hugging_face_cache_without_network(tmp_path):
-    repo = tmp_path / "models--google--gemma-scope-2b-pt-res-canonical"
+    # Lo que deja `hf download google/gemma-scope-2b-pt-res --include "layer_20/width_16k/average_l0_71/*"`.
+    repo = tmp_path / "models--google--gemma-scope-2b-pt-res"
     (repo / "refs").mkdir(parents=True)
     (repo / "refs" / "main").write_text("abc123")
     matrix = w_dec(3)
-    save_npz(repo / "snapshots" / "abc123" / "layer_20" / "width_16k" / "canonical" / "params.npz", matrix)
+    save_npz(repo / "snapshots" / "abc123" / CANONICAL_20 / "params.npz", matrix)
     resolver = GemmaScopeResolver(None, hf_cache_dir=str(tmp_path))
     torch.testing.assert_close(resolver.resolve(FID, D_MODEL).vector, matrix[7])
 
 
 def test_resolution_errors(tmp_path):
     resolver = GemmaScopeResolver(str(tmp_path), hf_cache_dir=str(tmp_path / "hf"))
-    with pytest.raises(FeatureNotFoundError, match="hf download google/gemma-scope-2b-pt-res-canonical"):
+    hint = 'hf download google/gemma-scope-2b-pt-res --include "layer_20/width_16k/average_l0_71/*"'
+    with pytest.raises(FeatureNotFoundError, match=re.escape(hint)):
         resolver.resolve(FID, D_MODEL)
     with pytest.raises(FeatureError, match="atención"):
         resolver.resolve("gemma-2-2b/20-gemmascope-att-16k/7", D_MODEL)
