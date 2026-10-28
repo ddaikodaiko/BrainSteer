@@ -1,0 +1,63 @@
+# --------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --------------------------------------- Entornos de Python (virtuales y portables)
+.venv/
+venv/
+env/
+.conda/
+conda-env/
+python-portable/
+python_portable/
+python_embeded/
+python_embedded/
+WPy*/
+.python-version
+
+# ------------------------------- Pesos, checkpoints y cachés de Hugging Face
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.ckpt
+*.onnx
+.cache/
+hf_cache/
+huggingface/
+
+# --------------------------------------------------------- Node / Vite
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+
+# --------------------------------------------------------------- Tauri
+src-tauri/target/
+
+# ---------------------------------------------------- Secretos y locales
+.env
+.env.*
+!.env.example
+
+# -------------------------------------------------------- Editor / SO
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+.DS_Store
+Thumbs.db
+*.log

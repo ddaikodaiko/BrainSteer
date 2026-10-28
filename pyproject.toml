@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latentflow"
+version = "0.1.0"
+description = "BrainSteer / LatentFlow: steering de atención con SKOP, servidor FastAPI por WebSocket y cabina web."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+models = ["transformers>=4.44", "accelerate", "bitsandbytes"]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "transformers>=4.44"]
+test = ["pytest>=7", "pytest-timeout", "httpx", "websockets>=12"]
+
+[project.scripts]
+latentflow-server = "latentflow.api.server:main"
+latentflow-dev = "latentflow.tools.dev_backend:main"
+
+[tool.setuptools.packages.find]
+include = ["latentflow*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+timeout = 120

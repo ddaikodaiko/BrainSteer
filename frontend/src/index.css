@@ -1,0 +1,209 @@
+@import 'tailwindcss';
+@import 'reactflow/dist/style.css';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  --color-ink-950: #05070b;
+  --color-ink-900: #0a0e15;
+  --color-ink-850: #0e131c;
+  --color-ink-800: #131a25;
+  --color-ink-700: #1c2533;
+  --color-ink-600: #283345;
+  --color-ink-500: #47546a;
+  --color-ink-400: #5d6b80;
+  --color-ink-300: #8a97ab;
+  --color-ink-200: #b8c2d1;
+  --color-ink-100: #e3e8ef;
+
+  --color-signal: #39f5b4;      /* fósforo del osciloscopio */
+  --color-ortho: #38bdf8;       /* Orthogonal Projection */
+  --color-additive: #f472b6;    /* Additive Steering */
+  --color-warn: #fbbf24;
+  --color-danger: #fb7185;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ------------------------------------------------------------ React Flow */
+.react-flow {
+  --rf-edge: #2f3d52;
+  background: radial-gradient(1200px 600px at 20% 0%, #0d1520 0%, var(--color-ink-950) 60%);
+}
+
+.react-flow__edge-path {
+  stroke: var(--rf-edge);
+}
+
+.react-flow__edge.active-edge .react-flow__edge-path {
+  stroke: var(--color-signal);
+  filter: drop-shadow(0 0 3px rgb(57 245 180 / 0.55));
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--color-ink-200);
+}
+
+.react-flow__connection-path {
+  stroke: var(--color-signal);
+  stroke-width: 2;
+}
+
+.react-flow__handle {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--color-ink-950);
+  background: var(--color-ink-400);
+  transition: background 120ms, box-shadow 120ms;
+}
+
+.react-flow__handle.connectingto,
+.react-flow__handle:hover {
+  background: var(--color-signal);
+  box-shadow: 0 0 0 4px rgb(57 245 180 / 0.18);
+}
+
+.react-flow__controls {
+  box-shadow: none;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.react-flow__controls-button {
+  background: var(--color-ink-850);
+  border-bottom: 1px solid var(--color-ink-700);
+  fill: var(--color-ink-200);
+}
+
+.react-flow__controls-button:hover {
+  background: var(--color-ink-700);
+}
+
+.react-flow__minimap {
+  background: var(--color-ink-900);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 10px;
+}
+
+.react-flow__attribution {
+  background: transparent;
+  color: var(--color-ink-400);
+}
+
+.react-flow__attribution a {
+  color: var(--color-ink-400);
+}
+
+/* ----------------------------------------------------- Slider de alpha */
+.alpha-slider {
+  --fill-from: 50%;
+  --fill-to: 50%;
+  --fill-color: var(--color-ortho);
+  appearance: none;
+  width: 100%;
+  height: 22px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.alpha-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background:
+    linear-gradient(
+      to right,
+      transparent var(--fill-from),
+      var(--fill-color) var(--fill-from),
+      var(--fill-color) var(--fill-to),
+      transparent var(--fill-to)
+    ),
+    var(--color-ink-700);
+}
+
+.alpha-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background:
+    linear-gradient(
+      to right,
+      transparent var(--fill-from),
+      var(--fill-color) var(--fill-from),
+      var(--fill-color) var(--fill-to),
+      transparent var(--fill-to)
+    ),
+    var(--color-ink-700);
+}
+
+.alpha-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 999px;
+  background: var(--color-ink-100);
+  border: 3px solid var(--fill-color);
+  box-shadow: 0 0 0 4px rgb(0 0 0 / 0.35);
+}
+
+.alpha-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--color-ink-100);
+  border: 3px solid var(--fill-color);
+}
+
+.alpha-slider:focus-visible {
+  outline: none;
+}
+
+.alpha-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 4px rgb(56 189 248 / 0.4);
+}
+
+/* Inputs numéricos sin spinners nativos */
+input[type='number'].no-spin::-webkit-inner-spin-button,
+input[type='number'].no-spin::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+input[type='number'].no-spin {
+  -moz-appearance: textfield;
+}
+
+.caret::after {
+  content: '▍';
+  margin-left: 1px;
+  color: var(--color-signal);
+  animation: blink 1s steps(1) infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) transparent;
+}
