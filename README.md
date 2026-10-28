@@ -49,6 +49,10 @@ El `CORSMiddleware` de FastAPI no sirve para esto, porque no se aplica a WebSock
 
 El servidor escucha en `127.0.0.1`. No lo expongas en la red sin autenticación.
 
+## Licencia
+
+[MIT](LICENSE) © 2026 ddaikodaiko / BrainSteer Team.
+
 ## Tests
 
 ```bash
