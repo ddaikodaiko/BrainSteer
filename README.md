@@ -64,6 +64,7 @@ flowchart LR
 | [`latentflow/core/sae.py`](latentflow/core/sae.py) | Resolución sin red de IDs de Neuronpedia a `W_dec[f]` (Gemma Scope local, caché de Hugging Face, ficheros `.safetensors`/`.npz`/`.pt`) |
 | [`latentflow/api/server.py`](latentflow/api/server.py) | Servidor FastAPI + WebSocket: streaming, hot-swap, plan por capa, protección de Origin |
 | [`latentflow/tools/initializer.py`](latentflow/tools/initializer.py) | CLI `latentflow-calibrate`: genera el artefacto de calibración a partir de datasets locales |
+| [`latentflow/tools/probe.py`](latentflow/tools/probe.py) | CLI `latentflow-probe`: compara generaciones sin steering y con cada α (vanilla y SKOP) para un prompt |
 | [`latentflow/tools/dev_backend.py`](latentflow/tools/dev_backend.py) | CLI `latentflow-dev`: el mismo servidor sobre un modelo tiny, sin GPU |
 | [`frontend/`](frontend/README.md) | Cabina visual: canvas de nodos, chat, osciloscopio |
 
@@ -216,6 +217,17 @@ en `ready.layers` y responde `invalid_layer` a cualquier otra.
 El artefacto es `latentflow.skop/v3` (Focus Set por masa, media por pasos y
 $\Sigma_{\Delta K}$ por cabeza de query). Los de la versión anterior (`v2`) se
 rechazan al cargar: hay que regenerarlos con `latentflow-calibrate`.
+
+Antes de abrir la cabina puedes ver el efecto de `r_q` con `latentflow-probe`: genera
+con el mismo prompt (greedy) sin steering y con cada α, en modo vanilla y SKOP,
+sobre todas las capas calibradas (o las de `--layers`). Cierra antes el servidor si
+está abierto, porque cada proceso carga su propia copia del modelo:
+
+```bash
+latentflow-probe --calibration calib/gemma2_skop.pt \
+    --prompt "Write a short email to my boss asking for a day off." \
+    --alphas 0,2,-2,4,-4,8,-8 --modes additive,skop -o probe.jsonl
+```
 
 ### 6. Arrancar el servidor
 
