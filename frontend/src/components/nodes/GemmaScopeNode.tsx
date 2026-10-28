@@ -110,7 +110,7 @@ function resolutionStatus(featureId: string, source: string | null, active: bool
     return { label: 'r_q calibrado', tone: 'text-ink-400', title: 'Sin Feature ID: usa la dirección r_q calibrada por SKOP' }
   }
   if (parseGemmaScopeId(featureId)?.site === 'att') {
-    return { label: 'att: no soportado', tone: 'text-danger', title: 'Los SAEs de atención no viven en el residual stream' }
+    return { label: 'error: att no soportado', tone: 'text-danger', title: 'Los SAEs de atención no viven en el residual stream' }
   }
   if (source === 'dev-hash') {
     return { label: 'simulada (dev)', tone: 'text-warn', title: 'Dev backend: vector determinista derivado del hash del ID' }
