@@ -5,7 +5,7 @@ Cliente web de [`latentflow/api/server.py`](../latentflow/api/server.py): un
 inyectores de capa SKOP, un **chat en streaming** y un **osciloscopio de riesgo**
 que dibuja token a token el cociente de Rayleigh de las cabezas de atención.
 
-React 18 · TypeScript estricto · Zustand 5 · React Flow 11 · Tailwind CSS 4 · Vite 7 · Vitest 3.
+React 18 · TypeScript estricto · Zustand 5 · React Flow 11 · Tailwind CSS 4 · Vite 7 · Vitest 3 (+ jsdom y Testing Library para componentes).
 
 ```bash
 npm ci
@@ -79,12 +79,15 @@ una capa (`isValidConnection` rechaza el resto y los duplicados).
 **`GemmaScopeNode`** — una dirección de steering.
 - **Feature ID** de Neuronpedia (`gemma-2-2b/20-gemmascope-res-16k/12082`), con
   enlace directo a su página. Vacío significa "usa el `r_q` calibrado por SKOP".
+  Se edita en un borrador local: el ID llega al circuito (y al servidor) al pulsar
+  **Enter** o al salir del campo, nunca a medio escribir; **Esc** lo descarta.
 - **Slider de α** de −5 a 5 (paso 0.05), con relleno desde el cero; un doble clic
   en el valor lo devuelve a 0.
 - **Estado de resolución**, leído del snapshot del servidor:
 
   | Rótulo | Significado |
   | --- | --- |
+  | `↵ para aplicar` | Hay un borrador sin confirmar en el campo |
   | `W_dec ✓` | El servidor leyó el decoder de los pesos locales de Gemma Scope |
   | `simulada (dev)` | Backend de desarrollo: vector determinista derivado del ID |
   | `pendiente` | Conectada a una capa activa, esperando al servidor |
@@ -279,7 +282,8 @@ Vite falla en vez de saltar a otro que el servidor rechazaría.
 | `src/lib/circuit.test.ts` | Serialización: payload exacto, composición de features, fusión de capas, rangos, SAEs `att`, capa natural |
 | `src/store/useCircuitStore.test.ts` | Debounce con timers falsos (barrido → 1 envío), deduplicación, `flush`, offline/reconexión, *clamping* |
 | `src/lib/telemetryBuffer.test.ts` | Anillo, huecos `NaN`, marcadores, `version`, escala del eje Y |
-| `src/lib/dispatch.test.ts` | Parseo de eventos, `ready`, streaming al chat y a la telemetría, errores de circuito |
+| `src/lib/dispatch.test.ts` | Parseo de eventos, `ready`, streaming al chat y a la telemetría, errores de circuito, `invalid_message` de `generate` y de `update` |
+| `src/components/nodes/GemmaScopeNode.test.tsx` | Feature ID (jsdom + Testing Library): teclear no envía, Enter/blur aplican, Esc descarta |
 
 El CI (`.github/workflows/ci.yml`) ejecuta `npm ci`, `npm test` y `npm run build`
 en cada push a `main` y en cada pull request.

@@ -193,6 +193,10 @@ Revisa el resumen que imprime:
 - **`pares Focus × Tail`** debe ser > 0. Si es 0, ninguna key supera `tau_high`; prueba un `--tau-high` menor.
 - **`rango medio de U_ΔK`** indica cuántas direcciones elimina P_ΔK (γ = 0.90).
 
+Con `--layers 18-22` sólo se calibran esas capas (un índice fuera del modelo es un
+error, no se reinterpreta). El servidor adopta las capas del artefacto: las anuncia
+en `ready.layers` y responde `invalid_layer` a cualquier otra.
+
 ### 6. Arrancar el servidor
 
 ```bash
@@ -212,8 +216,9 @@ La cabecera debe mostrar **SAE: Gemma Scope local**.
 
 ### 8. Primer circuito
 
-1. En un nodo *Gemma Scope*, escribe `gemma-2-2b/20-gemmascope-res-16k/12082`
-   (busca más en [Neuronpedia](https://www.neuronpedia.org/gemma-2-2b)).
+1. En un nodo *Gemma Scope*, escribe `gemma-2-2b/20-gemmascope-res-16k/12082` y
+   pulsa **Enter** (o sal del campo). Mientras escribes no se envía nada; **Esc**
+   descarta el borrador. Busca más features en [Neuronpedia](https://www.neuronpedia.org/gemma-2-2b).
 2. Conéctalo a un *inyector de capa* en la **capa 21**. Un SAE residual de la capa
    *L* describe el residual tras el bloque *L*, así que su entrada natural son las
    queries de *L + 1*.
@@ -436,6 +441,10 @@ Los campos desconocidos se rechazan (`invalid_message`).
   aplica en la siguiente frontera de token, sin cortar el stream. Las
   actualizaciones de una sesión se aplican en orden; si dos caen en la misma
   frontera, prevalece la más reciente.
+- **Barrera con `generate`:** un `generate` espera a que terminen los `update` que
+  la sesión envió antes que él, así que su prefill ya usa las features resueltas
+  (mientras espera, `accepted` llega con `queued: true`). Un `update` posterior al
+  `generate` se aplica como hot-swap durante el stream.
 - **Respuestas:** `update_accepted` inmediato (con `features` resueltas y
   `deferred: true` si hay una generación en curso) y, al aplicarse, un evento
   `circuit` difundido a **todas** las sesiones, porque el circuito es global al
@@ -446,7 +455,7 @@ Los campos desconocidos se rechazan (`invalid_message`).
 | `type` | Campos | Cuándo |
 | --- | --- | --- |
 | `ready` | `model`, `geometry`, `layers`, `hidden_size`, `sae`, `circuit` | Al conectar |
-| `accepted` | `request_id`, `queued` | Generación encolada (`queued`: la GPU estaba ocupada) |
+| `accepted` | `request_id`, `queued` | Generación encolada (`queued`: la GPU estaba ocupada o espera a un `update` anterior) |
 | `start` | `request_id`, `prompt_tokens`, `circuit` | Empieza la generación |
 | `token` | `request_id`, `index`, `token`, `token_id`, `circuit_version`, `telemetry` | Cada token (**STREAM_CHUNK**) |
 | `end` | `request_id`, `reason` (`eos` \| `length` \| `cancelled` \| `stop` \| `error`), `num_tokens`, `text`, `elapsed_s`, `tokens_per_s` | Fin de la generación |
@@ -455,7 +464,7 @@ Los campos desconocidos se rechazan (`invalid_message`).
 | `calibrated` | `num_pairs`, `num_utility`, `circuit` | Recalibración terminada |
 | `status` | `circuit`, `busy`, `active_request_id`, `sessions` | Respuesta a `status` |
 | `pong` | `server_time` | Respuesta a `ping` |
-| `error` | `code`, `message`, `request_id?`, `details?` | Ver tabla de errores |
+| `error` | `code`, `message`, `request_id?`, `action?`, `details?` | Ver tabla de errores |
 
 `token` puede llegar vacío si el token completa un carácter UTF-8 multibyte: el
 texto se emite con el token siguiente.
@@ -513,7 +522,7 @@ lista de `{layer, alpha, mode, features?}`. Cada feature trae `source`, que vale
 
 | `code` | Causa |
 | --- | --- |
-| `invalid_message` | JSON no válido, `action` desconocida, campo desconocido o fuera de rango (`details` lleva los errores de validación) |
+| `invalid_message` | JSON no válido, `action` desconocida, campo desconocido o fuera de rango. `message` resume el primer error, `details` los lleva todos, y `action` y `request_id` identifican el mensaje rechazado cuando se pueden leer |
 | `busy` | `generate` con otra generación activa en la sesión (incluye su `request_id`) |
 | `idle` | `cancel` sin generación activa |
 | `empty_update` | `update` sin cambios |
@@ -542,6 +551,12 @@ lista de `{layer, alpha, mode, features?}`. Cada feature trae `source`, que vale
 | `LATENTFLOW_ALLOW_MISSING_ORIGIN` | `1` | Acepta clientes sin `Origin` (scripts y CLI) |
 | `LATENTFLOW_HOST` / `LATENTFLOW_PORT` | `127.0.0.1` / `8000` | Interfaz y puerto de `latentflow-server` |
 
+`latentflow-server` y `latentflow-dev` validan estas variables al arrancar: un valor
+mal escrito (p. ej. `LATENTFLOW_ALPHA=abc`) termina con código 2 y un mensaje que
+nombra la variable, antes de cargar el modelo. Los booleanos aceptan `1`/`0`,
+`true`/`false`, `yes`/`no` y `on`/`off`. Importar `latentflow.api.server` no lee el
+entorno; `uvicorn latentflow.api.server:app` sigue funcionando y crea la app al pedirla.
+
 ## Seguridad
 
 El WebSocket valida el header `Origin` en el handshake. Por defecto sólo acepta el
@@ -551,6 +566,10 @@ puede tomar el control del modelo (Cross-Site WebSocket Hijacking). El
 `CORSMiddleware` de FastAPI no sirve para esto, porque no se aplica a WebSockets.
 `Origin: null` y los handshakes con varios `Origin` se rechazan siempre; `*` en la
 lista desactiva la protección (sólo para depuración).
+
+Los Feature IDs se usan como nombres de carpeta bajo `LATENTFLOW_SAE_DIR`: los
+segmentos `.` y `..` se rechazan (`feature_invalid`) y ninguna ruta candidata sale
+de esa raíz.
 
 El servidor escucha en `127.0.0.1`. No lo expongas en la red sin autenticación.
 

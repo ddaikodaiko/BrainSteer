@@ -13,8 +13,10 @@ requires-python = ">=3.10"
 dependencies = ["torch>=2.1"]
 
 [project.optional-dependencies]
-models = ["transformers>=4.44", "accelerate", "bitsandbytes"]
-server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "transformers>=4.44"]
+# transformers>=4.48: la atención eager devuelve sus pesos sin `output_attentions`
+# (los lee la calibración Focus/Tail). accelerate: `device_map="auto"` al cargar.
+models = ["transformers>=4.48", "accelerate>=0.26", "bitsandbytes"]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "transformers>=4.48", "accelerate>=0.26"]
 test = ["pytest>=7", "pytest-timeout", "httpx", "websockets>=12"]
 
 [project.scripts]

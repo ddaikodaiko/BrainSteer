@@ -221,6 +221,8 @@ export interface ErrorEvent {
   code: string
   message: string
   request_id?: string
+  /** En `invalid_message`: la acción del mensaje rechazado, si se pudo leer. */
+  action?: string
   details?: unknown
 }
 

@@ -34,6 +34,7 @@ a partir del sha256 del ID: el mismo ID da el mismo vector en cualquier proceso
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 from collections import OrderedDict
@@ -86,6 +87,10 @@ class FeatureRef:
     @classmethod
     def parse(cls, feature_id: str) -> "FeatureRef":
         raw = feature_id.strip()
+        # Modelo y SAE se usan como nombres de carpeta bajo LATENTFLOW_SAE_DIR: un
+        # segmento hecho sólo de puntos ('.', '..') saldría de esa raíz.
+        if any(segment and set(segment) <= {"."} for segment in raw.split("/")):
+            raise FeatureError(f"Feature ID '{feature_id}': '.' y '..' no son nombres válidos de modelo ni de SAE")
         m = _GEMMA_SCOPE_ID.match(raw)
         if m:
             sae_id = raw.split("/")[1]
@@ -194,6 +199,9 @@ class GemmaScopeResolver:
                     variants = sorted((tree / rel).glob("average_l0_*/params.npz"))
                     if len(variants) == 1:
                         out.append(variants[0])
+            # Defensa en profundidad (ver `FeatureRef.parse`): nunca fuera de la raíz.
+            root = os.path.normpath(self.root)
+            out = [p for p in out if os.path.commonpath([root, os.path.normpath(p)]) == root]
         return out
 
     def _find(self, ref: FeatureRef) -> Path:

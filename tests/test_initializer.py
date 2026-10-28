@@ -125,6 +125,30 @@ def test_cli_refuses_to_overwrite_without_force(datasets, tmp_path, capsys):
     assert torch.load(output, weights_only=True)["layer_ids"] == [0, 2]
 
 
+def test_server_cold_loads_an_artifact_calibrated_on_a_layer_subset(datasets, tmp_path, monkeypatch):
+    """#1: `--layers 0,2` daba código 0 en el CLI y el servidor no arrancaba."""
+    output = tmp_path / "subset.pt"
+    assert main(cli_args(datasets, output, "--layers", "0,2")) == 0
+    monkeypatch.setenv("LATENTFLOW_CALIBRATION", str(output))
+    with TestClient(create_dev_app(DevModelSpec(num_layers=DEV_LAYERS, delay=0.0, calibrated=False))) as client:
+        assert client.app.state.runtime.engine.layer_ids == [0, 2]
+        with client.websocket_connect("/ws/stream") as ws:
+            ready = ws.receive_json()
+            assert ready["layers"] == [0, 2] and ready["circuit"]["calibrated"] is True
+            ws.send_json({"action": "update", "layers": [{"layer": 1, "alpha": 1.0, "mode": "orthogonal"}]})
+            error = ws.receive_json()
+            assert (error["code"], error["valid_layers"]) == ("invalid_layer", [0, 2])
+
+
+def test_cli_rejects_layers_beyond_the_model(datasets, tmp_path, capsys):
+    """#6: con 3 capas, `--layers 1-5` no debe envolver 3, 4 y 5 a 0, 1 y 2."""
+    output = tmp_path / "skop.pt"
+    assert main(cli_args(datasets, output, "--layers", "1-5")) == 2
+    err = capsys.readouterr().err
+    assert "fuera de rango [3, 4, 5]" in err and "3 capas" in err
+    assert not output.exists()
+
+
 def test_cli_runs_as_module_entrypoint():
     result = subprocess.run(
         [sys.executable, "-m", "latentflow.tools.initializer", "--help"], cwd=ROOT, capture_output=True, text=True, timeout=120

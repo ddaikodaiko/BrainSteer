@@ -1,6 +1,6 @@
 import { useCircuitStore } from '../store/useCircuitStore'
 import { useSessionStore } from '../store/useSessionStore'
-import { ServerEvent, type ServerMessage } from './protocol'
+import { ClientAction, ServerEvent, type ServerMessage } from './protocol'
 import { telemetryBuffer } from './telemetryBuffer'
 
 /** Errores del servidor que invalidan el último `UPDATE_CIRCUIT` enviado. */
@@ -79,10 +79,15 @@ export function handleServerMessage(msg: ServerMessage): void {
       pingSentAt = null
       return
 
-    case ServerEvent.ERROR:
-      if (CIRCUIT_ERRORS.has(msg.code)) circuit.markSync('error', msg.message)
+    case ServerEvent.ERROR: {
+      // `invalid_message` dice qué acción falló: un update rechazado invalida la
+      // sincronización y un generate rechazado nunca recibirá `accepted` ni `end`.
+      const rejected = msg.code === 'invalid_message' ? msg.action : undefined
+      if (CIRCUIT_ERRORS.has(msg.code) || rejected === ClientAction.UPDATE_CIRCUIT) circuit.markSync('error', msg.message)
+      if (rejected === ClientAction.GENERATE && msg.request_id) session.failRequest(msg.request_id)
       if (msg.code === 'idle') return // cancelar sin generación activa: inocuo
       session.pushSystem(`⚠ ${msg.code}: ${msg.message}`, msg.request_id)
       return
+    }
   }
 }

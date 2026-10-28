@@ -42,6 +42,32 @@ def test_parse_neuronpedia_ids():
             FeatureRef.parse(bad)
 
 
+@pytest.mark.parametrize("bad", ["../secret/2", "gemma-2-2b/../0", "./sae/1", ".../x/3", "m/./4"])
+def test_dot_segments_are_rejected(bad):
+    with pytest.raises(FeatureError, match=r"'\.' y '\.\.'"):
+        FeatureRef.parse(bad)
+
+
+def test_dots_inside_names_are_still_valid():
+    ref = FeatureRef.parse("llama-3.1-8b/res..v2/3")
+    assert (ref.model, ref.sae_id, ref.index) == ("llama-3.1-8b", "res..v2", 3)
+
+
+def test_resolver_never_reads_outside_its_root(tmp_path):
+    """Seguridad: `../secret/2` leía `<root>/../secret/params.npz`."""
+    save_npz(tmp_path / "secret" / "params.npz", w_dec())
+    save_npz(tmp_path / "secret.npz", w_dec())
+    root = tmp_path / "saes"
+    root.mkdir()
+    resolver = GemmaScopeResolver(str(root), use_hf_cache=False)
+    for bad in ("../secret/2", "x/../2"):
+        with pytest.raises(FeatureError, match=r"'\.\.'"):
+            resolver.resolve(bad, D_MODEL)
+    # Aunque un ID con puntos pasara el parser, los candidatos no salen de la raíz.
+    sneaky = FeatureRef("../secret/2", "..", "secret", 2)
+    assert resolver._candidates(sneaky) == []
+
+
 def test_hash_resolver_is_deterministic_across_processes():
     resolver = HashFeatureResolver()
     a = resolver.resolve(FID, 32)

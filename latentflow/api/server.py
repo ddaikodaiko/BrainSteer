@@ -9,7 +9,10 @@ Arranque::
 
     LATENTFLOW_MODEL_ID=google/gemma-2-2b-it \\
     LATENTFLOW_CALIBRATION=calib/gemma2_skop.pt \\
-    uvicorn latentflow.api.server:app --host 127.0.0.1 --port 8000
+    latentflow-server                      # o: uvicorn latentflow.api.server:app
+
+Importar el módulo no crea la app ni lee el entorno; ``latentflow-server`` valida
+``LATENTFLOW_*`` al arrancar y sale con código 2 y un mensaje claro si algo falla.
 
 Protocolo ``/ws/stream``
 ------------------------
@@ -69,7 +72,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import sys
 import threading
 import time
 import uuid
@@ -88,7 +93,10 @@ from transformers.generation.streamers import BaseStreamer
 from latentflow.core.sae import FeatureError, FeatureNotFoundError, FeatureResolver, GemmaScopeResolver, ResolvedFeature
 from latentflow.core.steering import DEFAULT_MODEL_ID, SKOPConfig, SKOPEngine, load_quantized_model
 
-__all__ = ["DEFAULT_ALLOWED_ORIGINS", "OriginPolicy", "ServerSettings", "InferenceRuntime", "build_runtime", "create_app", "app"]
+__all__ = [
+    "DEFAULT_ALLOWED_ORIGINS", "OriginPolicy", "ServerSettings", "SettingsError", "InferenceRuntime",
+    "build_runtime", "create_app",
+]
 
 logger = logging.getLogger("latentflow.api")
 
@@ -99,9 +107,33 @@ TelemetryMode = Literal["none", "summary", "risky", "all"]
 # --------------------------------------------------------------------------- #
 # Configuración
 # --------------------------------------------------------------------------- #
+class SettingsError(ValueError):
+    """Variable ``LATENTFLOW_*`` con un valor no válido (mensaje para el usuario)."""
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
-    return default if value is None else value.strip().lower() in ("1", "true", "yes", "on")
+    if value is None or not value.strip():
+        return default
+    flag = value.strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    raise SettingsError(f"{name}={value!r} no es un booleano (usa 1/0, true/false, yes/no u on/off)")
+
+
+def _env_number(name: str, default: Any, kind: Callable[[str], Any], minimum: Optional[float] = None) -> Any:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        number = kind(value.strip())
+    except ValueError:
+        raise SettingsError(f"{name}={value!r} no es un número {'entero' if kind is int else 'real'}") from None
+    if not math.isfinite(number) or (minimum is not None and number < minimum):
+        raise SettingsError(f"{name}={value!r} fuera de rango" + (f" (mínimo {minimum})" if minimum is not None else ""))
+    return number
 
 
 def _env_list(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -140,13 +172,14 @@ class ServerSettings:
 
     @classmethod
     def from_env(cls) -> "ServerSettings":
+        """Lee ``LATENTFLOW_*``; un valor mal escrito lanza ``SettingsError`` con su nombre."""
         return cls(
             model_id=os.environ.get("LATENTFLOW_MODEL_ID", DEFAULT_MODEL_ID),
             load_in_4bit=_env_bool("LATENTFLOW_LOAD_IN_4BIT", True),
             calibration_path=os.environ.get("LATENTFLOW_CALIBRATION") or None,
-            alpha=float(os.environ.get("LATENTFLOW_ALPHA", "1.0")),
+            alpha=_env_number("LATENTFLOW_ALPHA", 1.0, float),
             steering_on_start=_env_bool("LATENTFLOW_STEERING_ON_START", True),
-            max_prompt_tokens=int(os.environ.get("LATENTFLOW_MAX_PROMPT_TOKENS", "4096")),
+            max_prompt_tokens=_env_number("LATENTFLOW_MAX_PROMPT_TOKENS", 4096, int, minimum=1),
             allowed_origins=_env_list("LATENTFLOW_ALLOWED_ORIGINS", DEFAULT_ALLOWED_ORIGINS),
             allow_missing_origin=_env_bool("LATENTFLOW_ALLOW_MISSING_ORIGIN", True),
             sae_dir=os.environ.get("LATENTFLOW_SAE_DIR") or None,
@@ -285,6 +318,17 @@ _client_message = TypeAdapter(ClientMessage)
 
 def _error(code: str, message: str, **extra: Any) -> Event:
     return {"type": "error", "code": code, "message": message, **extra}
+
+
+def _message_context(raw: str) -> Dict[str, str]:
+    """``action`` y ``request_id`` de un mensaje que no pasó la validación, si se leen."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: data[k] for k in ("action", "request_id") if isinstance(data.get(k), str) and len(data[k]) <= 64}
 
 
 # --------------------------------------------------------------------------- #
@@ -754,7 +798,8 @@ def build_runtime(settings: ServerSettings) -> InferenceRuntime:
 @dataclass
 class _ActiveGeneration:
     job: GenerationJob
-    future: "asyncio.Future[Any]" = field(repr=False)
+    # None mientras la generación espera a los `update` anteriores (barrera de sesión).
+    future: Optional["asyncio.Future[Any]"] = field(default=None, repr=False)
 
 
 class StreamSession:
@@ -763,7 +808,10 @@ class StreamSession:
         self.runtime = runtime
         self.outbox: "asyncio.Queue[Event]" = asyncio.Queue()
         self.active: Optional[_ActiveGeneration] = None
-        # Las actualizaciones se aplican en orden aunque alguna espere a leer un SAE.
+        # Barrera de la sesión: los `update` se aplican en orden aunque alguno espere a
+        # leer un SAE, y un `generate` no llega al worker hasta que terminan los
+        # `update` recibidos antes que él (el lock de asyncio despierta en orden FIFO
+        # y las tareas arrancan en el orden en que se crean).
         self._update_lock = asyncio.Lock()
         self._tasks: Set["asyncio.Task[None]"] = set()
 
@@ -843,7 +891,13 @@ class StreamSession:
         try:
             msg = _client_message.validate_json(raw)
         except ValidationError as exc:
-            self.send(_error("invalid_message", "Mensaje no válido", details=json.loads(exc.json(include_url=False))))
+            details = json.loads(exc.json(include_url=False))
+            first = details[0] if details else None
+            where = ".".join(str(p) for p in first.get("loc", ())) if first else ""
+            summary = f"Mensaje no válido ({where}: {first['msg']})" if first and where else "Mensaje no válido"
+            # `action` y `request_id` permiten al cliente saber qué petición falló
+            # (p. ej. liberar el chat si era un `generate`).
+            self.send(_error("invalid_message", summary, details=details, **_message_context(raw)))
             return
         handler = {
             GenerateRequest: self._on_generate,
@@ -862,9 +916,22 @@ class StreamSession:
             return
         request_id = msg.request_id or uuid.uuid4().hex[:12]
         job = GenerationJob(self.runtime, msg, request_id, self.send_threadsafe)
-        queued = self.runtime.busy
-        self.active = _ActiveGeneration(job, self.runtime.submit(job.run))
-        self.send({"type": "accepted", "request_id": request_id, "queued": queued})
+        active = self.active = _ActiveGeneration(job)
+        waiting = self._update_lock.locked()
+        self.send({"type": "accepted", "request_id": request_id, "queued": self.runtime.busy or waiting})
+        self._spawn(self._start_generation(active))
+
+    async def _start_generation(self, active: _ActiveGeneration) -> None:
+        # El prefill debe ver el circuito con las features ya resueltas: espera a que
+        # los `update` anteriores terminen. Una cancelación durante la espera llega
+        # al job, que termina con `reason: "cancelled"` sin hacer forwards.
+        async with self._update_lock:
+            active.future = self.runtime.submit(active.job.run)
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def _on_update(self, msg: UpdateRequest) -> None:
         changes = msg.changes()
@@ -879,9 +946,7 @@ class StreamSession:
             self.send(_error("invalid_layer", f"Capas fuera del rango calibrado: {unknown}",
                              valid_layers=self.runtime.engine.layer_ids))
             return
-        task = asyncio.create_task(self._apply_update(changes))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._spawn(self._apply_update(changes))
 
     async def _apply_update(self, changes: Dict[str, Any]) -> None:
         async with self._update_lock:
@@ -918,7 +983,7 @@ class StreamSession:
 
     def _on_calibrate(self, msg: CalibrateRequest) -> None:
         if len(msg.positive) != len(msg.negative):
-            self.send(_error("invalid_message", "positive y negative deben tener la misma longitud"))
+            self.send(_error("invalid_message", "positive y negative deben tener la misma longitud", action="calibrate"))
             return
         if self.runtime.tokenizer is None:
             self.send(_error("no_tokenizer", "El runtime no tiene tokenizer"))
@@ -1002,19 +1067,31 @@ def create_app(
     return app
 
 
-app = create_app()
+def __getattr__(name: str) -> Any:
+    # `uvicorn latentflow.api.server:app` sigue funcionando, pero la app (y la lectura
+    # de LATENTFLOW_*) se crea al pedirla, no al importar el módulo.
+    if name == "app":
+        globals()["app"] = created = create_app()
+        return created
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def main() -> None:
+def main() -> int:
+    """CLI ``latentflow-server``: valida la configuración antes de cargar nada."""
     import uvicorn
 
+    try:
+        settings = ServerSettings.from_env()
+        port = _env_number("LATENTFLOW_PORT", 8000, int, minimum=1)
+        if port > 65535:
+            raise SettingsError(f"LATENTFLOW_PORT={port} fuera de rango (1–65535)")
+    except SettingsError as exc:
+        print(f"latentflow-server: error: {exc}", file=sys.stderr)
+        return 2
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(
-        "latentflow.api.server:app",
-        host=os.environ.get("LATENTFLOW_HOST", "127.0.0.1"),
-        port=int(os.environ.get("LATENTFLOW_PORT", "8000")),
-    )
+    uvicorn.run(create_app(settings), host=os.environ.get("LATENTFLOW_HOST", "127.0.0.1"), port=port)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

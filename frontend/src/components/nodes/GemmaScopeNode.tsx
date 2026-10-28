@@ -1,4 +1,4 @@
-import { memo, type CSSProperties } from 'react'
+import { memo, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from 'react'
 import { Handle, Position, type NodeProps } from 'reactflow'
 import {
   ALPHA_MAX,
@@ -19,7 +19,33 @@ function GemmaScopeNodeImpl({ id, data, selected }: NodeProps<GemmaScopeData>) {
   const removeNode = useCircuitStore((s) => s.removeNode)
   const active = useCircuitStore((s) => s.serialized.derived[id]?.active ?? false)
   const source = useCircuitStore((s) => featureSource(s.serverCircuit, data.featureId))
-  const status = resolutionStatus(data.featureId, source, active)
+
+  // El ID se edita en un borrador local y sólo llega al circuito (y al servidor) al
+  // pulsar Enter o al salir del campo: nada de UPDATE_CIRCUIT con IDs a medio escribir.
+  const [draft, setDraft] = useState(data.featureId)
+  const discardDraft = useRef(false)
+  useEffect(() => setDraft(data.featureId), [data.featureId])
+  const commitDraft = () => {
+    if (discardDraft.current) {
+      discardDraft.current = false
+      return
+    }
+    const next = draft.trim()
+    if (next !== data.featureId) updateNodeData(id, { featureId: next })
+    else setDraft(next)
+  }
+  const onFeatureKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') e.currentTarget.blur()
+    if (e.key === 'Escape') {
+      discardDraft.current = true
+      setDraft(data.featureId)
+      e.currentTarget.blur()
+    }
+  }
+  const editing = draft.trim() !== data.featureId
+  const status = editing
+    ? { label: '↵ para aplicar', tone: 'text-ink-300', title: 'Enter o salir del campo: aplicar · Esc: descartar' }
+    : resolutionStatus(data.featureId, source, active)
 
   const url = neuronpediaUrl(data.featureId)
   const zero = ((0 - ALPHA_MIN) / (ALPHA_MAX - ALPHA_MIN)) * 100
@@ -48,9 +74,12 @@ function GemmaScopeNodeImpl({ id, data, selected }: NodeProps<GemmaScopeData>) {
           id={`${id}-feature`}
           className="nodrag w-full rounded-lg border border-ink-700 bg-ink-950/70 px-2.5 py-1.5 font-mono text-[11.5px] text-ink-100 placeholder:text-ink-600 focus:border-ortho/70 focus:outline-none"
           placeholder="gemma-2-2b/20-gemmascope-res-16k/12082"
-          value={data.featureId}
+          value={draft}
           spellCheck={false}
-          onChange={(e) => updateNodeData(id, { featureId: e.target.value })}
+          enterKeyHint="done"
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitDraft}
+          onKeyDown={onFeatureKeyDown}
         />
         <div className="flex h-4 items-center justify-between text-[10.5px]">
           {url ? (

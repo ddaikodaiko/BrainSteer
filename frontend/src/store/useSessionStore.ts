@@ -49,6 +49,8 @@ interface SessionState {
   startStream: (requestId: string, promptTokens: number) => void
   appendChunk: (requestId: string, chunk: string) => void
   endStream: (requestId: string, reason: EndReason, tokens: number, tokensPerS: number | null) => void
+  /** El servidor rechazó el `generate` antes de aceptarlo: libera el chat. */
+  failRequest: (requestId: string) => void
   pushSystem: (text: string, requestId?: string) => void
 }
 
@@ -140,6 +142,12 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     if (!chunk) return
     set((s) => ({ messages: updateByRequest(s.messages, requestId, (m) => ({ ...m, text: m.text + chunk })) }))
   },
+
+  failRequest: (requestId) =>
+    set((s) => ({
+      activeRequestId: s.activeRequestId === requestId ? null : s.activeRequestId,
+      messages: updateByRequest(s.messages, requestId, (m) => ({ ...m, status: 'error' })),
+    })),
 
   endStream: (requestId, reason, tokens, tokensPerS) =>
     set((s) => ({

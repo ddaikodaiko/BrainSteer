@@ -9,8 +9,12 @@ cambian el tamaño del modelo y el tokenizer.
 import asyncio
 import dataclasses
 import json
+import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,6 +26,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from latentflow.api.server import DEFAULT_ALLOWED_ORIGINS, OriginPolicy, ServerSettings, create_app  # noqa: E402
+from latentflow.api.server import main as server_main  # noqa: E402
 from latentflow.core.sae import GemmaScopeResolver, HashFeatureResolver  # noqa: E402
 from latentflow.tools.dev_backend import (  # noqa: E402
     CharTokenizer,
@@ -31,7 +36,9 @@ from latentflow.tools.dev_backend import (  # noqa: E402
     create_dev_app,
     dev_runtime_factory,
 )
+from latentflow.tools.dev_backend import main as dev_main  # noqa: E402
 
+ROOT = Path(__file__).resolve().parents[1]
 VOCAB, N_LAYERS, N_HEADS = 100, 4, 8
 SETTINGS = ServerSettings(model_id="tiny-llama-test", load_in_4bit=False, alpha=2.0)
 
@@ -253,6 +260,17 @@ def test_invalid_messages_return_errors_without_closing(client, raw, code):
         assert ws.receive_json()["type"] == "pong"
 
 
+def test_invalid_message_names_the_failed_action_and_request(client):
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.receive_json()
+        ws.send_json({"action": "generate", "prompt": "hola", "request_id": "r9", "max_new_tokens": 0})
+        err = ws.receive_json()
+        assert (err["code"], err["action"], err["request_id"]) == ("invalid_message", "generate", "r9")
+        assert "max_new_tokens" in err["message"] and err["details"]
+        ws.send_text("[1, 2]")
+        assert "action" not in ws.receive_json()
+
+
 def test_disconnect_mid_generation_cancels_worker_job():
     with serve(delay=0.02) as client:
         runtime = client.app.state.runtime
@@ -452,6 +470,53 @@ def test_origin_policy_unit():
     assert not wildcard.is_allowed(["null"])
 
 
+def test_importing_the_server_with_a_bad_env_is_safe():
+    """#14: importar el módulo creaba la app y leía el entorno."""
+    env = {**os.environ, "LATENTFLOW_ALPHA": "abc"}
+    code = "import latentflow.api.server as s; assert 'app' not in vars(s); print('ok')"
+    result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and result.stdout.strip() == "ok", result.stderr
+
+
+@pytest.mark.parametrize("name,value,expected", [
+    ("LATENTFLOW_ALPHA", "abc", "LATENTFLOW_ALPHA='abc' no es un número real"),
+    ("LATENTFLOW_ALPHA", "nan", "fuera de rango"),
+    ("LATENTFLOW_MAX_PROMPT_TOKENS", "1.5", "no es un número entero"),
+    ("LATENTFLOW_MAX_PROMPT_TOKENS", "0", "mínimo 1"),
+    ("LATENTFLOW_LOAD_IN_4BIT", "quizás", "no es un booleano"),
+    ("LATENTFLOW_PORT", "70000", "1–65535"),
+])  # fmt: skip
+def test_server_cli_rejects_bad_env_before_loading_anything(monkeypatch, capsys, name, value, expected):
+    import uvicorn
+
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("no debe arrancar"))
+    assert server_main() == 2
+    assert expected in capsys.readouterr().err
+
+
+def test_server_cli_and_lazy_app_use_the_validated_env(monkeypatch):
+    import uvicorn
+    from fastapi import FastAPI
+
+    import latentflow.api.server as server_module
+
+    calls = []
+    monkeypatch.setenv("LATENTFLOW_ALPHA", " 3.5 ")
+    monkeypatch.setenv("LATENTFLOW_PORT", "9010")
+    monkeypatch.setenv("LATENTFLOW_LOAD_IN_4BIT", "off")
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append((app, kw)))
+    assert server_main() == 0
+    app, kw = calls[0]
+    assert isinstance(app, FastAPI) and kw == {"host": "127.0.0.1", "port": 9010}
+    settings = ServerSettings.from_env()
+    assert (settings.alpha, settings.load_in_4bit) == (3.5, False)
+    monkeypatch.delitem(vars(server_module), "app", raising=False)
+    assert isinstance(server_module.app, FastAPI)  # `uvicorn latentflow.api.server:app`
+    assert server_module.app is server_module.app
+    monkeypatch.delitem(vars(server_module), "app")
+
+
 def test_allowed_origins_from_env(monkeypatch):
     monkeypatch.setenv("LATENTFLOW_ALLOWED_ORIGINS", " http://localhost:3000 , https://app.local ,")
     monkeypatch.setenv("LATENTFLOW_ALLOW_MISSING_ORIGIN", "0")
@@ -516,6 +581,15 @@ def test_dev_app_serves_with_its_label_and_env_security(monkeypatch):
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/ws/stream", headers={"origin": "http://localhost:5173"}):
                 pass
+
+
+def test_dev_cli_rejects_bad_env(monkeypatch, capsys):
+    import uvicorn
+
+    monkeypatch.setenv("LATENTFLOW_ALPHA", "abc")
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("no debe arrancar"))
+    assert dev_main(["--delay", "0"]) == 2
+    assert "latentflow-dev: error: LATENTFLOW_ALPHA='abc'" in capsys.readouterr().err
 
 
 def test_dev_cli_args_and_tokenizer():
@@ -603,6 +677,40 @@ def test_updates_keep_their_order_while_a_feature_is_being_read(client):
     accepted = [m["changes"] for m in of_type(msgs, "update_accepted")]
     assert "layers" in accepted[0] and accepted[1] == {"reset_layers": True}
     assert runtime.engine.layer_plan is None and runtime.engine.layer_directions == {}
+
+
+@pytest.mark.parametrize("slow", [False, True], ids=["hash", "lectura-lenta"])
+def test_generate_right_after_a_feature_update_prefills_with_the_new_circuit(slow):
+    """#3: el prefill usaba el circuito anterior mientras se resolvía el SAE."""
+    with serve(delay=0.03) as client:
+        if slow:
+            client.app.state.runtime.feature_resolver = SlowResolver()
+        with client.websocket_connect("/ws/stream") as ws:
+            ws.receive_json()
+            ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
+            ws.send_json({"action": "generate", "prompt": "hola mundo", "chat": False, "max_new_tokens": 6})
+            msgs = recv_until(ws, lambda m: m["type"] == "end")
+    kinds = [m["type"] for m in msgs]
+    assert not of_type(msgs, "error")
+    assert kinds.index("update_accepted") < kinds.index("start")
+    plan = of_type(msgs, "start")[0]["circuit"]["layer_plan"]
+    assert plan[0]["features"][0]["feature_id"] == FID
+    assert [m["applied_at_index"] for m in of_type(msgs, "circuit")] == [None]  # antes del prefill
+    assert len({t["circuit_version"] for t in of_type(msgs, "token")}) == 1
+
+
+def test_cancel_while_waiting_for_a_feature_ends_without_forwards(client):
+    client.app.state.runtime.feature_resolver = SlowResolver()
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.receive_json()
+        ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
+        ws.send_json({"action": "generate", "prompt": "hola", "chat": False, "max_new_tokens": 5})
+        ws.send_json({"action": "generate", "prompt": "otra", "chat": False})
+        ws.send_json({"action": "cancel"})
+        msgs = recv_until(ws, lambda m: m["type"] == "end")
+    assert of_type(msgs, "error")[0]["code"] == "busy"
+    assert (msgs[-1]["reason"], msgs[-1]["num_tokens"]) == ("cancelled", 0)
+    assert not of_type(msgs, "token")
 
 
 def test_gemma_scope_weights_are_read_from_local_disk(client, tmp_path):

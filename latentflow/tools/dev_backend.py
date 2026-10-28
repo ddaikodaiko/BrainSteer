@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
@@ -39,7 +40,7 @@ import torch
 from fastapi import FastAPI
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from latentflow.api.server import InferenceRuntime, ServerSettings, create_app
+from latentflow.api.server import InferenceRuntime, ServerSettings, SettingsError, create_app
 from latentflow.core.sae import HashFeatureResolver
 from latentflow.core.steering import SKOPConfig, SKOPEngine
 
@@ -208,10 +209,15 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     import uvicorn
 
     args = _parse_args(argv)
+    try:
+        settings = ServerSettings.from_env()
+    except SettingsError as exc:
+        print(f"latentflow-dev: error: {exc}", file=sys.stderr)
+        return 2
     spec = DevModelSpec(
         num_layers=args.layers,
         num_heads=args.heads,
@@ -227,8 +233,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         logger.warning("Escuchando en %s: el servidor queda accesible desde la red", args.host)
     logger.info("%s en ws://%s:%d/ws/stream", spec.label, args.host, args.port)
-    uvicorn.run(create_dev_app(spec), host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(create_dev_app(spec, settings), host=args.host, port=args.port, log_level="warning")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

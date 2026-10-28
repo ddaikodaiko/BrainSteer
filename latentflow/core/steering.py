@@ -422,6 +422,17 @@ def _raise_stop(module: nn.Module, args: Any, output: Any) -> None:
     raise _StopForward
 
 
+def _check_layer_ids(layers: Sequence[int], n_layers: int) -> List[int]:
+    """Índices de capa ordenados y sin repetir; fuera de ``[0, n_layers)`` es un error."""
+    ids = sorted({int(i) for i in layers})
+    if not ids:
+        raise ValueError("No hay capas que intervenir")
+    outside = [i for i in ids if not 0 <= i < n_layers]
+    if outside:
+        raise ValueError(f"Capas fuera de rango {outside}: el modelo tiene {n_layers} capas (0–{n_layers - 1})")
+    return ids
+
+
 def _resolve_decoder_layers(model: nn.Module, layers_path: Optional[str]) -> nn.ModuleList:
     for path in (layers_path,) if layers_path else _DECODER_LAYER_PATHS:
         obj: Any = model
@@ -460,9 +471,7 @@ class SKOPEngine:
 
         n_layers = len(self.decoder_layers)
         layers = range(n_layers) if self.config.layers is None else self.config.layers
-        self.layer_ids: List[int] = sorted({int(i) % n_layers for i in layers})
-        if not self.layer_ids:
-            raise ValueError("No hay capas que intervenir")
+        self.layer_ids: List[int] = _check_layer_ids(layers, n_layers)
 
         self.sigma_delta_k: Dict[int, Tensor] = {}      # (H_kv, d, d)
         self.steering_vectors: Dict[int, Tensor] = {}   # r_q, (H, d)
@@ -720,7 +729,8 @@ class SKOPEngine:
                 if not isinstance(weights, Tensor):
                     raise RuntimeError(
                         "El módulo de atención no devuelve pesos: carga el modelo con "
-                        "attn_implementation='eager' (SDPA/Flash no los exponen)"
+                        "attn_implementation='eager' (SDPA/Flash no los exponen) y usa "
+                        "transformers>=4.48 (antes sólo los devolvía con output_attentions)"
                     )
                 results[layer] = focus_tail_second_moment(keys.pop(layer), weights, mask, tau, g.num_kv_heads)
 
@@ -1027,15 +1037,48 @@ class SKOPEngine:
             )
         if state["geometry"] != vars(self.geometry):
             raise ValueError("La calibración pertenece a un modelo con otra geometría de atención")
-        if list(state["layer_ids"]) != self.layer_ids:
-            raise ValueError("La calibración cubre otras capas")
-        self.sigma_delta_k = {int(l): t.to(_MATH_DTYPE) for l, t in state["sigma_delta_k"].items()}
-        self.steering_vectors = {int(l): t.to(_MATH_DTYPE) for l, t in state["steering_vectors"].items()}
+        saved = _check_layer_ids(state["layer_ids"], len(self.decoder_layers))
+        if self.config.layers is None:
+            # Sin capas pedidas, el motor adopta las del artefacto (p. ej. `--layers 0,2`).
+            layers = saved
+        else:
+            missing = sorted(set(self.layer_ids) - set(saved))
+            if missing:
+                raise ValueError(f"La calibración no cubre las capas pedidas {missing} (cubre {saved})")
+            layers = self.layer_ids
+        was_attached = self.is_attached
+        self._set_layer_ids(layers)
+        sigma = {int(l): t for l, t in state["sigma_delta_k"].items()}
+        vectors = {int(l): t for l, t in state["steering_vectors"].items()}
+        self.sigma_delta_k = {l: sigma[l].to(_MATH_DTYPE) for l in layers}
+        self.steering_vectors = {l: vectors[l].to(_MATH_DTYPE) for l in layers if l in vectors}
         self.num_utility_samples = int(state["num_utility_samples"])
         self.num_delta_pairs = int(state["num_delta_pairs"])
         self.num_concept_pairs = int(state["num_concept_pairs"])
         self.metadata = dict(state.get("meta", {}))
-        return self.fit() if fit else self
+        if fit:
+            self.fit()
+            if was_attached:
+                self.attach()
+        return self
+
+    def _set_layer_ids(self, layers: Sequence[int]) -> None:
+        """Cambia las capas del motor y descarta todo lo calculado sobre las anteriores."""
+        layers = list(layers)
+        if layers == self.layer_ids:
+            return
+        self.detach()
+        self.detach_telemetry()
+        self.layer_ids = layers
+        for table in (self.sigma_delta_k, self.steering_vectors, self.projectors, self.rayleigh,
+                      self.risk_mask, self._effective, self._risk_sigma):
+            table.clear()
+        self.risk_threshold = None
+        self._cast_cache.clear()
+        if self._layer_plan is not None:
+            self._layer_plan = {l: v for l, v in self._layer_plan.items() if l in layers} or None
+        self._direction_override = {l: v for l, v in self._direction_override.items() if l in layers}
+        self.reset_calibration()
 
     def save(self, path: str, metadata: Optional[Mapping[str, Any]] = None) -> None:
         torch.save(self.state_dict(metadata), path)

@@ -105,4 +105,29 @@ describe('handleServerMessage', () => {
     handleServerMessage({ type: ServerEvent.ERROR, code: 'invalid_layer', message: 'Capas fuera del rango' })
     expect(useCircuitStore.getState().sync).toMatchObject({ state: 'error', error: 'Capas fuera del rango' })
   })
+
+  it('invalid_message de un generate libera el chat en vez de dejarlo esperando', () => {
+    expect(useSessionStore.getState().generate('hola')).toBe(true)
+    const requestId = useSessionStore.getState().activeRequestId!
+    useCircuitStore.getState().markSync('acked')
+    handleServerMessage({
+      type: ServerEvent.ERROR,
+      code: 'invalid_message',
+      message: 'Mensaje no válido (generate.max_new_tokens: Input should be less than or equal to 4096)',
+      action: 'generate',
+      request_id: requestId,
+    })
+    const session = useSessionStore.getState()
+    expect(session.activeRequestId).toBeNull()
+    expect(session.messages.find((m) => m.requestId === requestId)!.status).toBe('error')
+    expect(session.messages.at(-1)!.text).toContain('max_new_tokens')
+    expect(useCircuitStore.getState().sync.state).toBe('acked') // no era un update
+    expect(session.generate('otra vez')).toBe(true)
+  })
+
+  it('invalid_message de un update marca el circuito como rechazado', () => {
+    handleServerMessage({ type: ServerEvent.ERROR, code: 'invalid_message', message: 'Mensaje no válido (update.layers)', action: 'update' })
+    expect(useCircuitStore.getState().sync).toMatchObject({ state: 'error', error: 'Mensaje no válido (update.layers)' })
+    expect(useSessionStore.getState().activeRequestId).toBeNull()
+  })
 })

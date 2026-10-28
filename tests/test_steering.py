@@ -659,6 +659,54 @@ def test_old_artifact_format_is_rejected(calibrated_engine):
         SKOPEngine(calibrated_engine.model).load_state_dict(state)
 
 
+def partial_artifact(layers=(0, 2)):
+    torch.manual_seed(3)
+    model = TinyCausalLM().eval()
+    engine = calibrate_tiny(SKOPEngine(model, SKOPConfig(layers=list(layers)))).fit()
+    return model, engine, engine.state_dict()
+
+
+def test_engine_without_explicit_layers_adopts_the_artifact_subset():
+    model, source, state = partial_artifact()
+    engine = SKOPEngine(model, SKOPConfig(alpha=2.0))  # todas las capas, como el servidor
+    assert engine.layer_ids == [0, 1, 2]
+    engine.load_state_dict(state)
+    assert engine.layer_ids == [0, 2] and sorted(engine.projectors) == [0, 2]
+    for l in (0, 2):
+        torch.testing.assert_close(engine.sigma_delta_k[l], source.sigma_delta_k[l])
+        assert torch.equal(engine.risk_mask[l], source.risk_mask[l])
+    assert engine.risk_threshold == pytest.approx(source.risk_threshold)
+    with engine.steering():
+        assert len(engine._handles) == 2  # sólo las capas calibradas
+    with pytest.raises(KeyError):
+        engine.set_layer_plan({1: (1.0, True)})
+
+
+def test_loading_a_subset_while_attached_reattaches_on_the_new_layers(calibrated_engine):
+    _, _, state = partial_artifact((1,))
+    calibrated_engine.set_layer_plan({0: (1.0, True), 1: (2.0, False)})
+    calibrated_engine.attach()
+    calibrated_engine.load_state_dict(state)
+    assert calibrated_engine.layer_ids == [1] and calibrated_engine.layer_plan == {1: (2.0, False)}
+    assert calibrated_engine.is_attached and len(calibrated_engine._handles) == 1
+    calibrated_engine.detach()
+
+
+def test_explicit_layers_load_their_slice_or_fail_if_not_covered():
+    model, source, state = partial_artifact()
+    only_two = SKOPEngine(model, SKOPConfig(layers=[2])).load_state_dict(state)
+    assert only_two.layer_ids == [2]
+    torch.testing.assert_close(only_two.sigma_delta_k[2], source.sigma_delta_k[2])
+    with pytest.raises(ValueError, match=r"no cubre las capas pedidas \[1\]"):
+        SKOPEngine(model, SKOPConfig(layers=[1, 2])).load_state_dict(state)
+
+
+@pytest.mark.parametrize("layers", [[0, 3], [-1], list(range(2, 9))])
+def test_layers_out_of_range_are_rejected_instead_of_wrapping(layers):
+    with pytest.raises(ValueError, match="fuera de rango"):
+        SKOPEngine(TinyCausalLM(), SKOPConfig(layers=layers))
+
+
 def test_tau_high_is_validated():
     with pytest.raises(ValueError, match="tau_high"):
         SKOPConfig(tau_high=1.0)
