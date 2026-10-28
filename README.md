@@ -15,6 +15,8 @@ IDE de steering de atención para LLMs locales (Gemma-2-2B-IT, Llama-3.1-8B en 4
 - **`latentflow/api/server.py`** — FastAPI + WebSocket (`/ws/stream`): streaming
   token a token con telemetría de riesgo, hot-swap del circuito en frontera de
   token y plan por capa.
+- **`latentflow/core/sae.py`** — resolución de features de Gemma Scope
+  (IDs de Neuronpedia) a su decoder `W_dec[f]` desde pesos locales, sin red.
 - **`latentflow/tools/initializer.py`** — CLI `latentflow-calibrate`: genera el
   artefacto de calibración a partir de datasets locales.
 - **`frontend/`** — cabina web en React Flow: editor de circuitos, chat en
@@ -68,6 +70,31 @@ latentflow-calibrate --dev --utility examples/calibration/utility.example.jsonl 
     --concept examples/calibration/concept.example.jsonl -o calib/dev_skop.pt
 LATENTFLOW_CALIBRATION=calib/dev_skop.pt latentflow-dev
 ```
+
+## Features de Gemma Scope en el canvas
+
+Un nodo *Gemma Scope* con un Feature ID de Neuronpedia
+(`gemma-2-2b/20-gemmascope-res-16k/12082`) conectado a un inyector de capa aporta
+la dirección del decoder de esa feature. El decoder vive en el residual stream
+(`d_model`), así que el motor lo lleva al espacio de queries de la capa con
+`r_q(f) = q_proj(input_layernorm(W_dec[f]))`. La dirección de la capa es
+`Σ_f α_f · r_q(f)`: un nodo sin ID aporta el `r_q` calibrado. El riesgo de
+Rayleigh se recalcula con esa dirección y P_ΔK se aplica sólo a sus cabezas de
+alto riesgo.
+
+- La entrada natural de un SAE residual de la capa *L* son las queries de la capa
+  *L + 1*; el canvas avisa si inyectas en otra.
+- Los SAEs de atención (`att`) no se pueden mapear a queries y se excluyen.
+- Los pesos se leen de `LATENTFLOW_SAE_DIR` (árbol de Gemma Scope o ficheros
+  `.safetensors`/`.npz`/`.pt` con `W_dec`) o de la caché local de Hugging Face:
+
+  ```bash
+  huggingface-cli download google/gemma-scope-2b-pt-res-canonical --include "layer_20/width_16k/canonical/*"
+  ```
+
+- En `latentflow-dev` cada ID se simula con un vector determinista (sha256 del ID).
+- Gemma Scope está entrenado sobre `gemma-2-2b` (base); usarlo con `-it` es una
+  transferencia habitual, no una garantía.
 
 ## Seguridad
 

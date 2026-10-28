@@ -1,5 +1,11 @@
 import type { Edge, Node } from 'reactflow'
-import { ClientAction, type LayerSpec, type SteeringMode, type UpdateCircuitMessage } from './protocol'
+import {
+  ClientAction,
+  type CircuitSnapshot,
+  type LayerSpec,
+  type SteeringMode,
+  type UpdateCircuitMessage,
+} from './protocol'
 
 // ------------------------------------------------------------------ nodos
 export const ALPHA_MIN = -5
@@ -40,6 +46,34 @@ export function clampLayer(value: number, numLayers: number | null): number {
 }
 
 const NEURONPEDIA_ID = /^[\w.-]+\/[\w.-]+\/\d+$/
+const GEMMA_SCOPE_ID = /^([\w.-]+)\/(\d+)-gemmascope-(res|mlp|att)-(\d+[km])\/(\d+)$/
+
+export interface GemmaScopeFeature {
+  model: string
+  /** Capa del SAE: su decoder describe el residual tras el bloque `layer`. */
+  layer: number
+  site: 'res' | 'mlp' | 'att'
+  width: string
+  index: number
+}
+
+/** `gemma-2-2b/20-gemmascope-res-16k/12082` -> partes; `null` si no es un ID de Gemma Scope. */
+export function parseGemmaScopeId(featureId: string): GemmaScopeFeature | null {
+  const m = GEMMA_SCOPE_ID.exec(featureId.trim())
+  if (!m) return null
+  return { model: m[1]!, layer: Number(m[2]), site: m[3] as GemmaScopeFeature['site'], width: m[4]!, index: Number(m[5]) }
+}
+
+/** Origen con el que el servidor resolvió una feature en el circuito aplicado, si está. */
+export function featureSource(snapshot: CircuitSnapshot | null, featureId: string): string | null {
+  const id = featureId.trim()
+  if (!id || !snapshot?.steering) return null
+  for (const entry of snapshot.layer_plan ?? []) {
+    const hit = entry.features?.find((f) => f.feature_id === id)
+    if (hit) return hit.source
+  }
+  return null
+}
 
 /** URL de Neuronpedia si el ID tiene la forma `modelo/sae/índice`. */
 export function neuronpediaUrl(featureId: string): string | null {
@@ -100,8 +134,9 @@ const round3 = (x: number) => Math.round(x * 1000) / 1000
  * Semántica:
  * - Las aristas válidas van de una feature (GemmaScope) a una capa (SKOPLayer).
  * - Una capa está activa si está habilitada y recibe al menos una feature habilitada.
- * - Su alpha es la suma de los alphas de esas features (superposición lineal:
- *   el servidor aplica, por cabeza, el vector r_q calibrado escalado por alpha).
+ * - Su dirección es la combinación lineal de sus features, `Σ α_f · r_q(f)`: con
+ *   Feature ID, el decoder del SAE llevado al espacio de queries de esa capa; sin
+ *   ID, el r_q calibrado. El `alpha` mostrado en la capa es `Σ α_f`.
  * - Varias capas con el mismo índice se fusionan: alphas sumados y, si los modos
  *   difieren, gana `orthogonal` (la opción conservadora), con aviso.
  */
@@ -123,12 +158,29 @@ export function serializeCircuit(
     })
   }
 
+  // Los SAEs de atención codifican salidas de cabezas, no el residual: no se pueden
+  // llevar al espacio de queries y se excluyen (el servidor los rechazaría).
+  const unsupported = new Set<string>()
+  for (const node of nodes) {
+    if (isFeatureNode(node) && node.data.enabled && parseGemmaScopeId(node.data.featureId)?.site === 'att') {
+      unsupported.add(node.id)
+    }
+  }
+  if (unsupported.size) {
+    diagnostics.push({
+      level: 'error',
+      code: 'attention_sae_unsupported',
+      message: 'Las features de SAEs de atención (att) no viven en el residual stream; se excluyen. Usa res o mlp.',
+      nodeIds: [...unsupported],
+    })
+  }
+
   // Features habilitadas que alimentan cada capa habilitada.
   const inputs = new Map<string, GemmaScopeFlowNode[]>()
   for (const edge of validEdges) {
     const source = byId.get(edge.source) as GemmaScopeFlowNode
     const target = byId.get(edge.target) as SKOPLayerFlowNode
-    if (!source.data.enabled || !target.data.enabled) continue
+    if (!source.data.enabled || !target.data.enabled || unsupported.has(source.id)) continue
     const list = inputs.get(target.id) ?? []
     if (!list.includes(source)) list.push(source)
     inputs.set(target.id, list)
@@ -193,12 +245,20 @@ export function serializeCircuit(
     })
   }
 
-  if (layers.some((l) => l.sources.some((s) => s.feature_id !== null))) {
+  // Un SAE de la capa L describe el residual tras el bloque L: su entrada natural son
+  // las queries de la capa L + 1. Otra capa es válida, pero conviene saberlo.
+  const mismatched: string[] = []
+  for (const l of layers) {
+    for (const s of l.sources) {
+      const parsed = s.feature_id ? parseGemmaScopeId(s.feature_id) : null
+      if (parsed && parsed.layer + 1 !== l.layer) mismatched.push(`${s.feature_id} → capa ${l.layer} (natural: ${parsed.layer + 1})`)
+    }
+  }
+  if (mismatched.length) {
     diagnostics.push({
       level: 'info',
-      code: 'feature_ids_metadata',
-      message:
-        'Los Feature IDs de Gemma Scope viajan en el DAG como metadatos: el servidor aplica el vector r_q calibrado por SKOP, no el decoder del SAE.',
+      code: 'sae_layer_mismatch',
+      message: `Features inyectadas fuera de la capa siguiente a su SAE: ${mismatched.join('; ')}.`,
     })
   }
   if (layers.length === 0) {
@@ -209,7 +269,14 @@ export function serializeCircuit(
     })
   }
 
-  const spec: LayerSpec[] = layers.map(({ layer, alpha, mode }) => ({ layer, alpha, mode }))
+  // Cada capa envía sus features: el servidor compone la dirección Σ α_f · r_q(f)
+  // (feature_id null = r_q calibrado) y `alpha` actúa como ganancia (1).
+  const spec: LayerSpec[] = layers.map(({ layer, mode, sources }) => ({
+    layer,
+    alpha: 1,
+    mode,
+    features: sources.map((s) => ({ feature_id: s.feature_id, alpha: round3(s.alpha) })),
+  }))
   const update: UpdateCircuitMessage = {
     action: ClientAction.UPDATE_CIRCUIT,
     steering: spec.length > 0,

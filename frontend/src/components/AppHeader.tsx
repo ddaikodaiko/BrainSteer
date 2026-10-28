@@ -18,6 +18,7 @@ export function AppHeader() {
   const url = useSessionStore((s) => s.url)
   const model = useSessionStore((s) => s.model)
   const latency = useSessionStore((s) => s.latencyMs)
+  const sae = useSessionStore((s) => s.sae)
   const server = useCircuitStore((s) => s.serverCircuit)
   const sync = useCircuitStore((s) => s.sync)
   const syncMeta = SYNC_META[sync.state]
@@ -46,6 +47,11 @@ export function AppHeader() {
       </div>
 
       {model && <span className="font-mono text-[11px] text-ink-300">{model}</span>}
+      {sae && (
+        <span className="font-mono text-[10.5px] text-ink-400" title={sae.root ? `LATENTFLOW_SAE_DIR=${sae.root}` : undefined}>
+          SAE: {sae.kind === 'dev-hash' ? 'simulado (dev)' : sae.kind === 'gemma-scope' ? 'Gemma Scope local' : sae.kind}
+        </span>
+      )}
 
       <div className="ml-auto flex flex-wrap items-center gap-2 font-mono text-[10.5px]">
         {server ? (

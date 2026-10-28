@@ -34,10 +34,37 @@ export const ServerEvent = {
 export type SteeringMode = 'additive' | 'orthogonal'
 export type TelemetryMode = 'none' | 'summary' | 'risky' | 'all'
 
+/** Componente de la dirección de una capa: feature de SAE o, con `null`, el r_q calibrado. */
+export interface FeatureSpec {
+  feature_id: string | null
+  alpha: number
+}
+
+/**
+ * Inyección en una capa. Con `features`, la dirección es `alpha · Σ_f alpha_f · r_q(f)`,
+ * con `r_q(f) = q_proj(input_layernorm(W_dec[f]))` calculado en el servidor.
+ */
 export interface LayerSpec {
   layer: number
   alpha: number
   mode: SteeringMode
+  features?: FeatureSpec[]
+}
+
+export interface ResolvedFeatureInfo extends FeatureSpec {
+  /** `dev-hash` (simulada), `gemma-scope:<ruta>` o `calibrated`. */
+  source: string
+  sae_layer?: number | null
+}
+
+export interface LayerPlanEntry extends Omit<LayerSpec, 'features'> {
+  features?: ResolvedFeatureInfo[]
+}
+
+export interface SaeInfo {
+  kind: 'dev-hash' | 'gemma-scope' | string
+  root?: string | null
+  hf_cache?: boolean
 }
 
 export interface AttentionGeometry {
@@ -60,7 +87,7 @@ export interface CircuitSnapshot {
   num_risky_heads: number
   risky_heads: Record<string, number[]>
   active_layers: number[]
-  layer_plan: LayerSpec[] | null
+  layer_plan: LayerPlanEntry[] | null
 }
 
 export interface HeadTelemetry {
@@ -125,6 +152,8 @@ export interface ReadyEvent {
   model: string
   geometry: AttentionGeometry
   layers: number[]
+  hidden_size: number
+  sae: SaeInfo
   circuit: CircuitSnapshot
 }
 export interface AcceptedEvent {
@@ -161,6 +190,7 @@ export interface UpdateAcceptedEvent {
   type: typeof ServerEvent.UPDATE_ACCEPTED
   changes: Record<string, unknown>
   deferred: boolean
+  features?: { feature_id: string; source: string; sae_layer: number | null }[]
 }
 export interface CircuitEvent {
   type: typeof ServerEvent.CIRCUIT

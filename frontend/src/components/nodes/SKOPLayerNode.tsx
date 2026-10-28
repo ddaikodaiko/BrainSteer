@@ -20,7 +20,10 @@ function SKOPLayerNodeImpl({ id, data, selected }: NodeProps<SKOPLayerData>) {
   const removeNode = useCircuitStore((s) => s.removeNode)
   const numLayers = useCircuitStore((s) => s.numLayers)
   const derived = useCircuitStore((s) => s.serialized.derived[id])
-  const riskyHeads = useCircuitStore((s) => s.serverCircuit?.risky_heads[String(data.layer)]?.length ?? null)
+  // El servidor omite las capas sin cabezas de riesgo: con snapshot, ausente = 0.
+  const riskyHeads = useCircuitStore((s) =>
+    s.serverCircuit ? (s.serverCircuit.risky_heads[String(data.layer)]?.length ?? 0) : null,
+  )
   const applied = useCircuitStore(
     (s) => s.serverCircuit?.steering === true && (s.serverCircuit.layer_plan?.some((p) => p.layer === data.layer) ?? false),
   )

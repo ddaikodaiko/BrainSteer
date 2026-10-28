@@ -25,7 +25,13 @@ Pipeline
 
           r_q = E[q_pos − q_neg]                                          (por cabeza de query)
 
-      o bien se pasa ya calculada a ``fit(steering_vectors=...)``.
+      o bien se pasa ya calculada a ``fit(steering_vectors=...)``. Una dirección
+      del residual stream (p. ej. el decoder ``W_dec[f]`` de un SAE de Gemma Scope)
+      se lleva al espacio de queries de cada capa con ``residual_to_query``::
+
+          r_q = q_proj(input_layernorm(v))
+
+      y se inyecta en caliente con ``set_layer_directions``.
 
 2. Proyector ortogonal (``compute_orthogonal_projector``)
    ``eigh(Sigma_ΔK) = V Λ Vᵀ``; se retienen las k primeras direcciones cuya
@@ -479,6 +485,7 @@ class SKOPEngine:
         self._use_projection = True
         self._layer_plan: Optional[Dict[int, Tuple[float, bool]]] = None  # capa -> (alpha, proyección)
         self.metadata: Dict[str, Any] = {}
+        self._direction_override: Dict[int, Tensor] = {}  # capa -> r_q en caliente (p. ej. features SAE)
         self.reset_calibration()
 
     # ----------------------------------------------------------------- alpha
@@ -540,6 +547,84 @@ class SKOPEngine:
         self._cast_cache.clear()
         if self.is_attached:
             self.attach()
+        return self
+
+    # ------------------------------------------------ direcciones externas
+    @property
+    def hidden_size(self) -> int:
+        config = self.model.config
+        if hasattr(config, "get_text_config"):
+            config = config.get_text_config()
+        return int(config.hidden_size)
+
+    @torch.no_grad()
+    def residual_to_query(self, layer: int, direction: Tensor) -> Tensor:
+        """Mapea una dirección del residual stream al espacio de queries de ``layer``.
+
+        ``r_q = q_proj(input_layernorm(v))``: es el cambio de la query cuando el
+        residual que entra al bloque apunta en la dirección ``v`` (p. ej. el decoder
+        de una feature de un SAE residual). La dirección es exacta; la escala absoluta
+        depende de la norma RMS de cada token, que aquí se fija con ``|v|``. Llama a
+        ``.forward`` de los módulos para no disparar los hooks de steering/telemetría.
+
+        Returns: (H, d) en float64/CPU.
+        """
+        g = self.geometry
+        vec = direction.detach().reshape(-1)
+        if vec.numel() != self.hidden_size:
+            raise ValueError(
+                f"La dirección tiene {vec.numel()} componentes y el residual del modelo {self.hidden_size}"
+            )
+        if not torch.isfinite(vec).all() or vec.abs().max() == 0:
+            raise ValueError("La dirección debe ser finita y no nula")
+        block = self.decoder_layers[layer]
+        q_proj = block.self_attn.q_proj
+        norm = getattr(block, "input_layernorm", None)
+        ref = getattr(norm, "weight", None)
+        if not isinstance(ref, Tensor) or not ref.is_floating_point():
+            ref = getattr(q_proj, "weight", None)  # sin norm (o pesos cuantizados): usa q_proj
+        device = ref.device if isinstance(ref, Tensor) else self._input_device()
+        dtype = ref.dtype if isinstance(ref, Tensor) and ref.is_floating_point() else torch.float32
+        x = vec.to(device=device, dtype=dtype).view(1, 1, -1)
+        if norm is not None:
+            x = norm.forward(x)
+        q = q_proj.forward(x)
+        return q.reshape(g.num_heads, g.head_dim).to(device="cpu", dtype=_MATH_DTYPE)
+
+    def steering_from_residual(self, direction: Tensor, layers: Optional[Sequence[int]] = None) -> Dict[int, Tensor]:
+        """``{capa: r_q}`` de una misma dirección residual; útil para ``fit(steering_vectors=...)``."""
+        return {l: self.residual_to_query(l, direction) for l in (self.layer_ids if layers is None else layers)}
+
+    @property
+    def layer_directions(self) -> Dict[int, Tensor]:
+        return dict(self._direction_override)
+
+    def direction_for(self, layer: int) -> Tensor:
+        """``r_q`` efectivo de la capa: la dirección inyectada en caliente o la calibrada."""
+        if layer in self._direction_override:
+            return self._direction_override[layer]
+        return self.steering_vectors[layer]
+
+    def set_layer_directions(self, directions: Optional[Mapping[int, Tensor]]) -> "SKOPEngine":
+        """Sustituye en caliente ``r_q`` en algunas capas; ``None`` vuelve a las calibradas.
+
+        Las direcciones (H, d) suelen venir de ``residual_to_query`` (features de un
+        SAE). El ranking global de Rayleigh se recalcula con las direcciones efectivas,
+        de modo que P_ΔK se aplica sólo a las cabezas de alto riesgo *para esas
+        direcciones*. Los ``r_q`` calibrados no se modifican ni se guardan con ellas.
+        """
+        g = self.geometry
+        overrides: Dict[int, Tensor] = {}
+        for l, v in (directions or {}).items():
+            if l not in self.layer_ids:
+                raise KeyError(f"La capa {l} no está en layer_ids")
+            d = v.detach().to("cpu", _MATH_DTYPE).reshape(g.num_heads, g.head_dim)
+            if not torch.isfinite(d).all():
+                raise ValueError(f"Dirección no finita para la capa {l}")
+            overrides[int(l)] = d
+        self._direction_override = overrides
+        if self.projectors and all(l in self.steering_vectors or l in overrides for l in self.layer_ids):
+            self.compute_risk()
         return self
 
     @property
@@ -753,7 +838,7 @@ class SKOPEngine:
         """
         if steering_vectors is not None:
             self._store_steering_vectors(steering_vectors)
-        missing = [l for l in self.layer_ids if l not in self.steering_vectors]
+        missing = [l for l in self.layer_ids if l not in self.steering_vectors and l not in self._direction_override]
         if missing:
             raise RuntimeError(
                 f"Falta r_q en las capas {missing}: pásalo a fit(steering_vectors=...) "
@@ -772,7 +857,7 @@ class SKOPEngine:
 
     def compute_risk(self) -> "SKOPEngine":
         """Cociente de Rayleigh por cabeza de query y máscara global top-(1-p)."""
-        if not self.projectors or not self.steering_vectors:
+        if not self.projectors or not (self.steering_vectors or self._direction_override):
             raise RuntimeError("Faltan proyectores o vectores de steering")
         kv_idx = self.geometry.kv_index()
         for l in self.layer_ids:
@@ -781,7 +866,7 @@ class SKOPEngine:
                 sigma = trace_normalize(sigma, self.config.rayleigh_eps)
             # GQA: cada cabeza de query se evalúa con la Σ de su grupo KV.
             self._risk_sigma[l] = sigma[kv_idx]
-            self.rayleigh[l] = rayleigh_quotient(self._risk_sigma[l], self.steering_vectors[l], self.config.eps)
+            self.rayleigh[l] = rayleigh_quotient(self._risk_sigma[l], self.direction_for(l), self.config.eps)
         scores = torch.stack([self.rayleigh[l] for l in self.layer_ids])  # (L, H)
         mask, self.risk_threshold = select_risky_heads(scores, self.config.risk_percentile)
         for i, l in enumerate(self.layer_ids):
@@ -792,7 +877,7 @@ class SKOPEngine:
     def _build_effective_vectors(self) -> None:
         kv_idx = self.geometry.kv_index()
         for l in self.layer_ids:
-            r = self.steering_vectors[l]
+            r = self.direction_for(l)
             projected = torch.einsum("hij,hj->hi", self.projectors[l].projector[kv_idx], r)
             use_projection = self.risk_mask[l] & self.projection_for(l)
             effective = torch.where(use_projection.unsqueeze(-1), projected, r)

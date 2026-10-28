@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from latentflow.api.server import DEFAULT_ALLOWED_ORIGINS, OriginPolicy, ServerSettings, create_app  # noqa: E402
+from latentflow.core.sae import GemmaScopeResolver, HashFeatureResolver  # noqa: E402
 from latentflow.tools.dev_backend import (  # noqa: E402
     CharTokenizer,
     DevModelSpec,
@@ -523,3 +524,133 @@ def test_dev_cli_args_and_tokenizer():
     enc = CharTokenizer(50)(["ab", "abcd"])
     assert enc["input_ids"].shape == (2, 4) and enc["attention_mask"].tolist() == [[1, 1, 0, 0], [1, 1, 1, 1]]
     assert int(enc["input_ids"].max()) < 50
+
+
+# --------------------------------------------------------------------------- #
+# Features de SAE (Gemma Scope) en el circuito
+# --------------------------------------------------------------------------- #
+FID = "gemma-2-2b/0-gemmascope-res-16k/12082"
+HIDDEN_TEST = 64  # hidden_size del runtime de los tests
+
+
+def feature_layers(alpha=2.5, fid=FID):
+    return [
+        {"layer": 1, "alpha": 1.0, "mode": "orthogonal",
+         "features": [{"feature_id": fid, "alpha": alpha}, {"feature_id": None, "alpha": -1.0}]},
+        {"layer": 3, "alpha": 0.5, "mode": "additive"},
+    ]
+
+
+def test_sae_feature_update_injects_mapped_decoder_direction(client):
+    engine = client.app.state.runtime.engine
+    with client.websocket_connect("/ws/stream") as ws:
+        ready = ws.receive_json()
+        assert ready["sae"] == {"kind": "dev-hash"} and ready["hidden_size"] == HIDDEN_TEST
+        ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
+        msgs = recv_until(ws, lambda m: m["type"] == "circuit")
+        assert of_type(msgs, "update_accepted")[0]["features"] == [{"feature_id": FID, "source": "dev-hash", "sae_layer": 0}]
+        plan = msgs[-1]["circuit"]["layer_plan"]
+        assert plan[0]["features"] == [
+            {"feature_id": FID, "alpha": 2.5, "source": "dev-hash", "sae_layer": 0},
+            {"feature_id": None, "alpha": -1.0, "source": "calibrated"},
+        ]
+        assert "features" not in plan[1]
+
+        # Dirección = Σ α_f · r_q(f), con r_q(f) = q_proj(input_layernorm(W_dec[f])).
+        decoder = HashFeatureResolver().resolve(FID, HIDDEN_TEST).vector
+        expected = 2.5 * engine.residual_to_query(1, decoder) - 1.0 * engine.steering_vectors[1]
+        torch.testing.assert_close(engine.direction_for(1), expected)
+        assert set(engine.layer_directions) == {1}
+
+        heads = of_type(generate(ws, max_new_tokens=2, telemetry="all"), "token")[0]["telemetry"]["heads"]
+    layer1 = [h for h in heads if h["layer"] == 1]
+    assert all(h["steered"] for h in layer1)
+    assert [h["baseline"] for h in layer1] == pytest.approx(engine.rayleigh[1].tolist(), abs=1e-6)
+    assert all(h["projected"] == h["risky"] for h in layer1)  # P_ΔK sólo en cabezas de riesgo
+
+
+def test_feature_slider_hot_swap_during_stream():
+    with serve(delay=0.02) as client:
+        engine = client.app.state.runtime.engine
+        with client.websocket_connect("/ws/stream") as ws:
+            ws.receive_json()
+            ws.send_json({"action": "generate", "prompt": "hola", "chat": False, "max_new_tokens": 30})
+            head = recv_until(ws, lambda m: m["type"] == "token")
+            for alpha in (1.0, -3.0):  # dos posiciones del slider
+                ws.send_json({"action": "update", "steering": True, "layers": feature_layers(alpha)})
+            msgs = head + recv_until(ws, lambda m: m["type"] == "end")
+    assert not of_type(msgs, "error")
+    assert [m["changes"]["layers"][0]["features"][0]["alpha"] for m in of_type(msgs, "update_accepted")] == [1.0, -3.0]
+    assert of_type(msgs, "circuit") and msgs[-1]["reason"] == "length" and msgs[-1]["num_tokens"] == 30
+    decoder = HashFeatureResolver().resolve(FID, HIDDEN_TEST).vector
+    torch.testing.assert_close(engine.direction_for(1), -3.0 * engine.residual_to_query(1, decoder) - engine.steering_vectors[1])
+
+
+class SlowResolver(HashFeatureResolver):
+    def resolve(self, feature_id, d_model):
+        time.sleep(0.3)
+        return super().resolve(feature_id, d_model)
+
+
+def test_updates_keep_their_order_while_a_feature_is_being_read(client):
+    runtime = client.app.state.runtime
+    runtime.feature_resolver = SlowResolver()
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.receive_json()
+        ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
+        ws.send_json({"action": "update", "reset_layers": True})  # llega antes de que acabe la lectura
+        msgs = recv_until(ws, lambda m: m["type"] == "circuit" and "reset_layers" in m["changes"])
+    accepted = [m["changes"] for m in of_type(msgs, "update_accepted")]
+    assert "layers" in accepted[0] and accepted[1] == {"reset_layers": True}
+    assert runtime.engine.layer_plan is None and runtime.engine.layer_directions == {}
+
+
+def test_gemma_scope_weights_are_read_from_local_disk(client, tmp_path):
+    import numpy as np
+
+    runtime = client.app.state.runtime
+    runtime.feature_resolver = GemmaScopeResolver(str(tmp_path), hf_cache_dir=str(tmp_path / "hf"))
+    with client.websocket_connect("/ws/stream") as ws:
+        version = ws.receive_json()["circuit"]["version"]
+        ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
+        err = ws.receive_json()
+        assert err["code"] == "feature_not_found" and "huggingface-cli download" in err["message"]
+        ws.send_json({"action": "update", "layers": feature_layers(fid="gemma-2-2b/0-gemmascope-att-16k/1")})
+        assert ws.receive_json()["code"] == "feature_invalid"
+        assert runtime.circuit.version == version  # nada aplicado
+
+        sae_dir = tmp_path / "gemma-scope-2b-pt-res-canonical" / "layer_0" / "width_16k" / "canonical"
+        sae_dir.mkdir(parents=True)
+        w_dec = np.random.default_rng(0).standard_normal((20000, HIDDEN_TEST)).astype(np.float32)
+        np.savez(sae_dir / "params.npz", W_dec=w_dec)
+        ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
+        msgs = recv_until(ws, lambda m: m["type"] in ("circuit", "error"))
+    assert msgs[-1]["type"] == "circuit", msgs[-1]
+    assert msgs[-1]["circuit"]["layer_plan"][0]["features"][0]["source"].startswith("gemma-scope:")
+    engine = runtime.engine
+    expected = 2.5 * engine.residual_to_query(1, torch.from_numpy(w_dec[12082])) - engine.steering_vectors[1]
+    torch.testing.assert_close(engine.direction_for(1), expected)
+
+
+def test_feature_spec_validation(client):
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.receive_json()
+        bad = [{"layer": 1, "alpha": 1.0, "mode": "additive", "features": [{"feature_id": "", "alpha": 1.0}]}]
+        ws.send_json({"action": "update", "layers": bad})
+        assert ws.receive_json()["code"] == "invalid_message"
+        # El simulador del dev backend acepta cualquier ID no vacío (también no-Neuronpedia).
+        ws.send_json({"action": "update", "layers": feature_layers(fid="mi-feature-libre")})
+        accepted = recv_until(ws, lambda m: m["type"] in ("update_accepted", "error"))[-1]
+        assert accepted["type"] == "update_accepted"
+        assert accepted["features"] == [{"feature_id": "mi-feature-libre", "source": "dev-hash", "sae_layer": None}]
+
+
+def test_merged_pending_updates_keep_the_latest_layer_intent(client):
+    """Dos cambios que caen en la misma frontera de token se fusionan sin invertir su orden."""
+    circuit = client.app.state.runtime.circuit
+    circuit.request({"steering": True, "layers": [{"layer": 1, "alpha": 2.0, "mode": "additive"}]})
+    circuit.request({"reset_layers": True})
+    assert circuit._pending == {"steering": True, "reset_layers": True}
+    circuit.request({"layers": [{"layer": 2, "alpha": 1.0, "mode": "orthogonal"}]})
+    assert "reset_layers" not in circuit._pending and circuit._pending["layers"][0]["layer"] == 2
+    circuit._pending.clear()

@@ -99,7 +99,8 @@ export const initialNodes: CircuitNode[] = [
     id: 'layer-a',
     type: 'skopLayer',
     position: { x: 440, y: 20 },
-    data: { layer: 12, mode: 'orthogonal', enabled: true },
+    // SAE residual de la capa 20 -> su entrada natural son las queries de la capa 21.
+    data: { layer: 21, mode: 'orthogonal', enabled: true },
   },
   {
     id: 'layer-b',

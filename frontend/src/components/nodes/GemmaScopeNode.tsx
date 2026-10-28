@@ -1,6 +1,14 @@
 import { memo, type CSSProperties } from 'react'
 import { Handle, Position, type NodeProps } from 'reactflow'
-import { ALPHA_MAX, ALPHA_MIN, ALPHA_STEP, neuronpediaUrl, type GemmaScopeData } from '../../lib/circuit'
+import {
+  ALPHA_MAX,
+  ALPHA_MIN,
+  ALPHA_STEP,
+  featureSource,
+  neuronpediaUrl,
+  parseGemmaScopeId,
+  type GemmaScopeData,
+} from '../../lib/circuit'
 import { useCircuitStore } from '../../store/useCircuitStore'
 import { FieldLabel, NodeShell } from './NodeShell'
 
@@ -10,6 +18,8 @@ function GemmaScopeNodeImpl({ id, data, selected }: NodeProps<GemmaScopeData>) {
   const updateNodeData = useCircuitStore((s) => s.updateNodeData<GemmaScopeData>)
   const removeNode = useCircuitStore((s) => s.removeNode)
   const active = useCircuitStore((s) => s.serialized.derived[id]?.active ?? false)
+  const source = useCircuitStore((s) => featureSource(s.serverCircuit, data.featureId))
+  const status = resolutionStatus(data.featureId, source, active)
 
   const url = neuronpediaUrl(data.featureId)
   const zero = ((0 - ALPHA_MIN) / (ALPHA_MAX - ALPHA_MIN)) * 100
@@ -50,8 +60,8 @@ function GemmaScopeNodeImpl({ id, data, selected }: NodeProps<GemmaScopeData>) {
           ) : (
             <span className="text-ink-500">Formato: modelo/sae/índice</span>
           )}
-          <span className="text-ink-400" title="El servidor aplica el vector r_q calibrado; el ID viaja como metadato del DAG">
-            metadato
+          <span className={status.tone} title={status.title}>
+            {status.label}
           </span>
         </div>
       </div>
@@ -92,6 +102,25 @@ function GemmaScopeNodeImpl({ id, data, selected }: NodeProps<GemmaScopeData>) {
       <Handle type="source" position={Position.Right} style={{ background: active ? ACCENT : undefined }} />
     </NodeShell>
   )
+}
+
+/** Cómo resolvió el servidor el decoder de la feature (ver `featureSource`). */
+function resolutionStatus(featureId: string, source: string | null, active: boolean) {
+  if (!featureId.trim()) {
+    return { label: 'r_q calibrado', tone: 'text-ink-400', title: 'Sin Feature ID: usa la dirección r_q calibrada por SKOP' }
+  }
+  if (parseGemmaScopeId(featureId)?.site === 'att') {
+    return { label: 'att: no soportado', tone: 'text-danger', title: 'Los SAEs de atención no viven en el residual stream' }
+  }
+  if (source === 'dev-hash') {
+    return { label: 'simulada (dev)', tone: 'text-warn', title: 'Dev backend: vector determinista derivado del hash del ID' }
+  }
+  if (source?.startsWith('gemma-scope:')) {
+    return { label: 'W_dec ✓', tone: 'text-signal', title: `Decoder leído de ${source.slice('gemma-scope:'.length)}` }
+  }
+  return active
+    ? { label: 'pendiente', tone: 'text-ink-300', title: 'Esperando a que el servidor resuelva el decoder' }
+    : { label: 'sin aplicar', tone: 'text-ink-500', title: 'Conéctala a un inyector de capa habilitado' }
 }
 
 export const GemmaScopeNode = memo(GemmaScopeNodeImpl)

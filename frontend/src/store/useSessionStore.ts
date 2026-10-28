@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { ClientAction, type AttentionGeometry, type EndReason, type TelemetryMode } from '../lib/protocol'
+import { ClientAction, type AttentionGeometry, type EndReason, type SaeInfo, type TelemetryMode } from '../lib/protocol'
 import { send } from '../lib/transport'
 import { useCircuitStore } from './useCircuitStore'
 
@@ -29,13 +29,14 @@ interface SessionState {
   reconnectAttempt: number
   model: string | null
   geometry: AttentionGeometry | null
+  sae: SaeInfo | null
   latencyMs: number | null
   messages: ChatMessage[]
   activeRequestId: string | null
   params: GenerateParams
 
   setConnection: (status: ConnectionStatus, attempt?: number) => void
-  setModel: (model: string, geometry: AttentionGeometry) => void
+  setModel: (model: string, geometry: AttentionGeometry, sae?: SaeInfo | null) => void
   setLatency: (ms: number) => void
   setParams: (patch: Partial<GenerateParams>) => void
 
@@ -66,6 +67,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   reconnectAttempt: 0,
   model: null,
   geometry: null,
+  sae: null,
   latencyMs: null,
   messages: [],
   activeRequestId: null,
@@ -82,7 +84,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       get().pushSystem('Conexión perdida: la generación en curso se ha interrumpido.')
     }
   },
-  setModel: (model, geometry) => set({ model, geometry }),
+  setModel: (model, geometry, sae = null) => set({ model, geometry, sae }),
   setLatency: (latencyMs) => set({ latencyMs }),
   setParams: (patch) => set((s) => ({ params: { ...s.params, ...patch } })),
 

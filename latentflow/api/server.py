@@ -23,6 +23,10 @@ Cliente -> servidor (JSON, campo ``action``)::
      "layers": [{"layer": 6, "alpha": 2.5, "mode": "orthogonal"},
                 {"layer": 12, "alpha": -1.0, "mode": "additive"}]}
     {"action": "update", "reset_layers": true}
+    {"action": "update", "steering": true,
+     "layers": [{"layer": 21, "alpha": 1.0, "mode": "orthogonal",
+                 "features": [{"feature_id": "gemma-2-2b/20-gemmascope-res-16k/12082", "alpha": 2.5},
+                              {"feature_id": null, "alpha": -1.0}]}]}
     {"action": "cancel"}
     {"action": "calibrate", "utility": ["..."], "positive": ["..."], "negative": ["..."]}
     {"action": "status"}
@@ -32,6 +36,15 @@ Servidor -> cliente (JSON, campo ``type``)::
 
     ready, accepted, start, token, end, update_accepted, circuit, calibrated,
     status, pong, error
+
+Features de SAE (Gemma Scope)
+-----------------------------
+Con ``features``, la dirección de la capa es ``alpha · Σ_f alpha_f · r_q(f)``, donde
+``r_q(f) = q_proj(input_layernorm(W_dec[f]))`` para una feature (el decoder se lee
+de los pesos locales, ver ``latentflow.core.sae``) y el ``r_q`` calibrado para
+``feature_id: null``. El riesgo de Rayleigh se recalcula con esa dirección, así que
+P_ΔK sólo se aplica a las cabezas de alto riesgo para ella. La lectura del decoder
+ocurre fuera del worker; el mapeo, en la frontera de token.
 
 Seguridad
 ---------
@@ -72,6 +85,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from transformers import StoppingCriteria, StoppingCriteriaList
 from transformers.generation.streamers import BaseStreamer
 
+from latentflow.core.sae import FeatureError, FeatureNotFoundError, FeatureResolver, GemmaScopeResolver, ResolvedFeature
 from latentflow.core.steering import DEFAULT_MODEL_ID, SKOPConfig, SKOPEngine, load_quantized_model
 
 __all__ = ["DEFAULT_ALLOWED_ORIGINS", "OriginPolicy", "ServerSettings", "InferenceRuntime", "build_runtime", "create_app", "app"]
@@ -121,6 +135,8 @@ class ServerSettings:
     # Protección cross-site del WebSocket (ver `OriginPolicy`).
     allowed_origins: Tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
     allow_missing_origin: bool = True
+    # Pesos locales de SAEs (Gemma Scope); además se consulta la caché de Hugging Face.
+    sae_dir: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "ServerSettings":
@@ -133,6 +149,7 @@ class ServerSettings:
             max_prompt_tokens=int(os.environ.get("LATENTFLOW_MAX_PROMPT_TOKENS", "4096")),
             allowed_origins=_env_list("LATENTFLOW_ALLOWED_ORIGINS", DEFAULT_ALLOWED_ORIGINS),
             allow_missing_origin=_env_bool("LATENTFLOW_ALLOW_MISSING_ORIGIN", True),
+            sae_dir=os.environ.get("LATENTFLOW_SAE_DIR") or None,
         )
 
 
@@ -193,12 +210,20 @@ class GenerateRequest(_Message):
     telemetry: TelemetryMode = "risky"
 
 
+class FeatureSpec(_Message):
+    """Componente de la dirección de una capa: feature de SAE o, con ``None``, el r_q calibrado."""
+
+    feature_id: Optional[str] = Field(None, min_length=1, max_length=256)
+    alpha: float = Field(ge=-1e3, le=1e3, allow_inf_nan=False)
+
+
 class LayerSpec(_Message):
-    """Inyección en una capa: alpha propio y modo de steering."""
+    """Inyección en una capa: alpha (ganancia), modo y, opcionalmente, sus features."""
 
     layer: int = Field(ge=0)
     alpha: float = Field(ge=-1e3, le=1e3, allow_inf_nan=False)
     mode: Literal["additive", "orthogonal"]
+    features: Optional[List[FeatureSpec]] = Field(None, max_length=64)
 
 
 class UpdateRequest(_Message):
@@ -273,10 +298,48 @@ class CircuitController:
         self.version = 0
         self._lock = threading.Lock()
         self._pending: Dict[str, Any] = {}
+        self._features: Dict[str, ResolvedFeature] = {}     # decoders ya resueltos (residual)
+        self._layer_features: Dict[int, List[Dict[str, Any]]] = {}
 
-    def request(self, changes: Dict[str, Any]) -> None:
+    def request(self, changes: Dict[str, Any], features: Optional[Dict[str, ResolvedFeature]] = None) -> None:
+        """Encola cambios; si aún no se aplicaron los anteriores, se fusionan y la
+        petición más reciente prevalece (también entre `layers` y `reset_layers`,
+        que se excluyen: si no, un reset posterior quedaría deshecho al aplicar)."""
         with self._lock:
+            self._features.update(features or {})
+            if "layers" in changes:
+                self._pending.pop("reset_layers", None)
+            if changes.get("reset_layers"):
+                self._pending.pop("layers", None)
             self._pending.update(changes)
+
+    def _layer_directions(self, specs: List[Dict[str, Any]]):
+        """Direcciones (H, d) de las capas con features. Se calcula antes de mutar nada."""
+        e = self.engine
+        directions: Dict[int, torch.Tensor] = {}
+        described: Dict[int, List[Dict[str, Any]]] = {}
+        for spec in specs:
+            feats = spec.get("features") or []
+            if not feats:
+                continue
+            layer = spec["layer"]
+            total: Optional[torch.Tensor] = None
+            desc: List[Dict[str, Any]] = []
+            for f in feats:
+                fid = f.get("feature_id")
+                if fid:
+                    resolved = self._features[fid]
+                    direction = e.residual_to_query(layer, resolved.vector)
+                    desc.append({"feature_id": fid, "alpha": f["alpha"], "source": resolved.source,
+                                 "sae_layer": resolved.layer})
+                else:
+                    direction = e.steering_vectors[layer]
+                    desc.append({"feature_id": None, "alpha": f["alpha"], "source": "calibrated"})
+                term = f["alpha"] * direction
+                total = term if total is None else total + term
+            directions[layer] = total
+            described[layer] = desc
+        return directions, described
 
     def has_pending(self) -> bool:
         with self._lock:
@@ -288,6 +351,8 @@ class CircuitController:
         if not changes:
             return None
         e = self.engine
+        if "layers" in changes:
+            directions, described = self._layer_directions(changes["layers"])
         refit = False
         if "gamma_energy" in changes:
             e.config.gamma_energy = changes["gamma_energy"]
@@ -302,9 +367,13 @@ class CircuitController:
         if "alpha" in changes:
             e.alpha = changes["alpha"]
         if changes.get("reset_layers"):
+            e.set_layer_directions(None)
             e.set_layer_plan(None)
+            self._layer_features = {}
         if "layers" in changes:
+            e.set_layer_directions(directions or None)
             e.set_layer_plan({s["layer"]: (s["alpha"], s["mode"] == "orthogonal") for s in changes["layers"]})
+            self._layer_features = described
         if "steering" in changes:
             if changes["steering"]:
                 e.attach()
@@ -330,7 +399,8 @@ class CircuitController:
             "risky_heads": {str(l): v for l, v in risky.items() if v},
             "active_layers": e.active_layers,
             "layer_plan": None if e.layer_plan is None else [
-                {"layer": l, "alpha": a, "mode": "orthogonal" if p else "additive"}
+                {"layer": l, "alpha": a, "mode": "orthogonal" if p else "additive",
+                 **({"features": self._layer_features[l]} if l in self._layer_features else {})}
                 for l, (a, p) in sorted(e.layer_plan.items())
             ],
         }
@@ -539,11 +609,19 @@ class GenerationJob:
 class InferenceRuntime:
     """Modelo + tokenizer + SKOPEngine, servidos por un único hilo worker."""
 
-    def __init__(self, model: Any, tokenizer: Any, engine: SKOPEngine, settings: ServerSettings) -> None:
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        engine: SKOPEngine,
+        settings: ServerSettings,
+        feature_resolver: Optional[FeatureResolver] = None,
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.engine = engine
         self.settings = settings
+        self.feature_resolver: FeatureResolver = feature_resolver or GemmaScopeResolver(settings.sae_dir)
         self.circuit = CircuitController(engine)
         self.sessions: Set["StreamSession"] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -594,8 +672,18 @@ class InferenceRuntime:
         return future
 
     # --------------------------------------------------- utilidades del worker
+    def resolve_features(self, feature_ids: List[str]) -> Dict[str, ResolvedFeature]:
+        """Lee los decoders (E/S, sin tocar el modelo): se ejecuta fuera del worker."""
+        d_model = self.engine.hidden_size
+        return {fid: self.feature_resolver.resolve(fid, d_model) for fid in feature_ids}
+
     def apply_circuit(self, applied_at_index: Optional[int] = None, request_id: Optional[str] = None) -> None:
-        changes = self.circuit.apply_pending()
+        try:
+            changes = self.circuit.apply_pending()
+        except Exception as exc:  # nunca debe tumbar una generación en curso
+            logger.exception("No se pudo aplicar el circuito")
+            self.broadcast(_error("circuit_apply_failed", f"{type(exc).__name__}: {exc}", request_id=request_id))
+            return
         if changes is not None:
             self.broadcast({
                 "type": "circuit",
@@ -657,7 +745,7 @@ def build_runtime(settings: ServerSettings) -> InferenceRuntime:
     if settings.calibration_path:
         logger.info("Cargando calibración SKOP de %s", settings.calibration_path)
         engine.load(settings.calibration_path)
-    return InferenceRuntime(model, tokenizer, engine, settings)
+    return InferenceRuntime(model, tokenizer, engine, settings, GemmaScopeResolver(settings.sae_dir))
 
 
 # --------------------------------------------------------------------------- #
@@ -675,6 +763,9 @@ class StreamSession:
         self.runtime = runtime
         self.outbox: "asyncio.Queue[Event]" = asyncio.Queue()
         self.active: Optional[_ActiveGeneration] = None
+        # Las actualizaciones se aplican en orden aunque alguna espere a leer un SAE.
+        self._update_lock = asyncio.Lock()
+        self._tasks: Set["asyncio.Task[None]"] = set()
 
     # ------------------------------------------------------------- envío
     def send(self, event: Event) -> None:
@@ -704,6 +795,8 @@ class StreamSession:
                 "model": self.runtime.settings.model_id,
                 "geometry": vars(self.runtime.engine.geometry),
                 "layers": self.runtime.engine.layer_ids,
+                "hidden_size": self.runtime.engine.hidden_size,
+                "sae": self.runtime.feature_resolver.describe(),
                 "circuit": self.runtime.circuit.snapshot(),
             })
             while True:
@@ -721,6 +814,8 @@ class StreamSession:
         finally:
             self.runtime.sessions.discard(self)
             self.cancel_active()
+            for task in list(self._tasks):
+                task.cancel()
             await self._drain_and_stop(sender)
 
     async def _drain_and_stop(self, sender: "asyncio.Task[None]") -> None:
@@ -784,12 +879,36 @@ class StreamSession:
             self.send(_error("invalid_layer", f"Capas fuera del rango calibrado: {unknown}",
                              valid_layers=self.runtime.engine.layer_ids))
             return
-        deferred = self.runtime.busy
-        self.runtime.circuit.request(changes)
-        # Si hay una generación en curso la aplicará en la siguiente frontera de
-        # token; este trabajo encolado la recoge si no queda ninguna.
-        self.runtime.submit(self.runtime.apply_circuit)
-        self.send({"type": "update_accepted", "changes": changes, "deferred": deferred})
+        task = asyncio.create_task(self._apply_update(changes))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _apply_update(self, changes: Dict[str, Any]) -> None:
+        async with self._update_lock:
+            feature_ids = sorted({
+                f["feature_id"] for s in changes.get("layers", []) for f in (s.get("features") or [])
+                if f.get("feature_id")
+            })
+            resolved: Dict[str, ResolvedFeature] = {}
+            if feature_ids:
+                try:
+                    resolved = await asyncio.to_thread(self.runtime.resolve_features, feature_ids)
+                except FeatureError as exc:
+                    code = "feature_not_found" if isinstance(exc, FeatureNotFoundError) else "feature_invalid"
+                    self.send(_error(code, str(exc)))
+                    return
+            deferred = self.runtime.busy
+            self.runtime.circuit.request(changes, resolved)
+            # Si hay una generación en curso la aplicará en la siguiente frontera de
+            # token; este trabajo encolado la recoge si no queda ninguna.
+            self.runtime.submit(self.runtime.apply_circuit)
+            self.send({
+                "type": "update_accepted",
+                "changes": changes,
+                "deferred": deferred,
+                **({"features": [{"feature_id": f.feature_id, "source": f.source, "sae_layer": f.layer}
+                                 for f in resolved.values()]} if resolved else {}),
+            })
 
     def _on_cancel(self, msg: CancelRequest) -> None:
         if self.active is None or self.active.job.finished.is_set():

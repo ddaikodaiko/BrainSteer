@@ -4,7 +4,14 @@ import { ServerEvent, type ServerMessage } from './protocol'
 import { telemetryBuffer } from './telemetryBuffer'
 
 /** Errores del servidor que invalidan el último `UPDATE_CIRCUIT` enviado. */
-const CIRCUIT_ERRORS = new Set(['invalid_layer', 'not_calibrated', 'empty_update'])
+const CIRCUIT_ERRORS = new Set([
+  'invalid_layer',
+  'not_calibrated',
+  'empty_update',
+  'feature_not_found',
+  'feature_invalid',
+  'circuit_apply_failed',
+])
 
 let pingSentAt: number | null = null
 export function notePingSent(): void {
@@ -18,7 +25,7 @@ export function handleServerMessage(msg: ServerMessage): void {
 
   switch (msg.type) {
     case ServerEvent.READY:
-      session.setModel(msg.model, msg.geometry)
+      session.setModel(msg.model, msg.geometry, msg.sae)
       circuit.setModelInfo(msg.geometry.num_layers, msg.layers)
       circuit.setServerCircuit(msg.circuit, false)
       // El circuito del servidor es global: tras (re)conectar, el grafo local manda.

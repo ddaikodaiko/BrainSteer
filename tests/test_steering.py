@@ -662,3 +662,133 @@ def test_old_artifact_format_is_rejected(calibrated_engine):
 def test_tau_high_is_validated():
     with pytest.raises(ValueError, match="tau_high"):
         SKOPConfig(tau_high=1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Direcciones de SAE (residual stream) como r_q
+# --------------------------------------------------------------------------- #
+def sae_column(seed=0):
+    """Una "columna de W_dec": dirección unitaria del residual stream (d_model)."""
+    v = torch.randn(HIDDEN, generator=torch.Generator().manual_seed(seed))
+    return v / v.norm()
+
+
+def test_residual_to_query_is_q_proj_and_bypasses_hooks(calibrated_engine):
+    e = calibrated_engine
+    v = sae_column(1)
+    expected = e.decoder_layers[1].self_attn.q_proj.weight.detach().to(F64) @ v.to(F64)  # sin input_layernorm
+    e.attach()
+    e.attach_telemetry()
+    try:
+        mapped = e.residual_to_query(1, v)
+    finally:
+        e.detach()
+    assert e.collect_telemetry() == {}, "el mapeo no debe disparar las sondas"
+    e.detach_telemetry()
+    assert mapped.shape == (N_HEADS, HEAD_DIM) and mapped.dtype == F64
+    torch.testing.assert_close(mapped.reshape(-1), expected, rtol=1e-5, atol=1e-6)
+    with pytest.raises(ValueError, match="componentes"):
+        e.residual_to_query(1, torch.ones(HIDDEN + 1))
+    with pytest.raises(ValueError, match="no nula"):
+        e.residual_to_query(1, torch.zeros(HIDDEN))
+
+
+def test_residual_to_query_applies_the_real_input_layernorm():
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    cfg = transformers.Gemma2Config(vocab_size=50, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                                    num_attention_heads=4, num_key_value_heads=2, head_dim=8, attn_implementation="eager")
+    model = transformers.Gemma2ForCausalLM(cfg).eval()
+    block = model.model.layers[1]
+    with torch.no_grad():
+        block.input_layernorm.weight.uniform_(-0.5, 0.5)  # Gemma: escala (1 + w)
+    engine = SKOPEngine(model)
+    v = torch.randn(32)
+    with torch.no_grad():
+        expected = block.self_attn.q_proj(block.input_layernorm(v.view(1, 1, -1))).reshape(4, 8)
+    torch.testing.assert_close(engine.residual_to_query(1, v), expected.to(F64))
+
+
+def test_sae_direction_injection_keeps_symmetry_and_rayleigh_bounds(calibrated_engine):
+    """Σ_ΔK viene de la factorización Kᵀ G K (utility set). Inyectar columnas SAE
+    sólo cambia r_q: Σ y P siguen simétricos (P idempotente) y el cociente de
+    Rayleigh de la nueva dirección queda entre los autovalores de Σ̂ = Σ/tr(Σ)."""
+    e = calibrated_engine
+    kv_idx = e.geometry.kv_index()
+    calibrated = {l: e.steering_vectors[l].clone() for l in e.layer_ids}
+    before_rayleigh = {l: e.rayleigh[l].clone() for l in e.layer_ids}
+    directions = {0: e.residual_to_query(0, sae_column(2)), 2: 2.5 * e.residual_to_query(2, sae_column(3))}
+    e.set_layer_directions(directions)
+
+    for l in e.layer_ids:
+        sigma = e.sigma_delta_k[l]
+        assert torch.equal(sigma, sigma.mT)
+        P = e.projectors[l].projector
+        assert torch.equal(P, P.mT)
+        torch.testing.assert_close(P @ P, P, rtol=0, atol=1e-10)
+        sigma_hat = trace_normalize(sigma, e.config.rayleigh_eps)[kv_idx]
+        evals = torch.linalg.eigvalsh(sigma_hat)
+        r = e.direction_for(l)
+        torch.testing.assert_close(e.rayleigh[l], rayleigh_quotient(sigma_hat, r))
+        assert torch.all(e.rayleigh[l] >= evals[:, 0] - 1e-12) and torch.all(e.rayleigh[l] <= evals[:, -1] + 1e-12)
+        assert torch.all((e.rayleigh[l] >= 0) & (e.rayleigh[l] <= 1))
+
+    # Las capas sin inyección conservan su r_q calibrado; los r_q calibrados no se tocan.
+    torch.testing.assert_close(e.direction_for(1), calibrated[1])
+    torch.testing.assert_close(e.rayleigh[1], before_rayleigh[1])
+    assert all(torch.equal(e.steering_vectors[l], calibrated[l]) for l in e.layer_ids)
+    torch.testing.assert_close(e.direction_for(2), directions[2])
+
+
+def test_sae_direction_is_projected_only_on_globally_risky_heads(calibrated_engine):
+    e = calibrated_engine
+    e.set_layer_directions({1: e.residual_to_query(1, sae_column(4))})
+    scores = torch.stack([e.rayleigh[l] for l in e.layer_ids])
+    assert sum(int(e.risk_mask[l].sum()) for l in e.layer_ids) == int((scores > e.risk_threshold).sum())
+    kv_idx = e.geometry.kv_index()
+    v = e.effective_vectors()[1]
+    r = e.direction_for(1)
+    for h in range(N_HEADS):
+        res = e.projectors[1]
+        if e.risk_mask[1][h]:
+            U = res.retained_basis()[kv_idx[h]]
+            torch.testing.assert_close(U.mT @ v[h], torch.zeros(HEAD_DIM, dtype=F64), rtol=0, atol=1e-10)
+            torch.testing.assert_close(v[h], e.alpha * res.projector[kv_idx[h]] @ r[h])
+        else:
+            torch.testing.assert_close(v[h], e.alpha * r[h])
+
+
+def test_sae_direction_scale_does_not_change_risk(calibrated_engine):
+    e = calibrated_engine
+    d = e.residual_to_query(2, sae_column(5))
+    e.set_layer_directions({2: d})
+    mask, scores = {l: m.clone() for l, m in e.risk_mask.items()}, e.rayleigh[2].clone()
+    e.set_layer_directions({2: -7.0 * d})
+    torch.testing.assert_close(e.rayleigh[2], scores)
+    assert all(torch.equal(mask[l], e.risk_mask[l]) for l in e.layer_ids)
+
+
+def test_clearing_injected_directions_restores_calibrated_state(calibrated_engine):
+    e = calibrated_engine
+    before = {l: v.clone() for l, v in e.effective_vectors().items()}
+    risk = {l: m.clone() for l, m in e.risk_mask.items()}
+    e.set_layer_directions({0: e.residual_to_query(0, sae_column(6))})
+    assert not torch.allclose(e.effective_vectors()[0], before[0])
+    e.set_layer_directions(None)
+    assert e.layer_directions == {}
+    for l in e.layer_ids:
+        torch.testing.assert_close(e.effective_vectors()[l], before[l])
+        assert torch.equal(e.risk_mask[l], risk[l])
+    assert "directions" not in " ".join(e.state_dict())  # las inyecciones no se persisten
+
+
+def test_fit_accepts_a_sae_column_for_every_layer():
+    torch.manual_seed(6)
+    model = TinyCausalLM().eval()
+    engine = SKOPEngine(model)
+    engine.accumulate_utility_batch(random_batch(n=4, t=10, seed=12))
+    engine.finalize_calibration()
+    engine.fit(steering_vectors=engine.steering_from_residual(sae_column(7)))
+    for l in engine.layer_ids:
+        torch.testing.assert_close(engine.steering_vectors[l], engine.residual_to_query(l, sae_column(7)))
+    assert engine.is_fitted and 0 < sum(int(m.sum()) for m in engine.risk_mask.values())

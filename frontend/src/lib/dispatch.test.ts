@@ -50,10 +50,13 @@ describe('handleServerMessage', () => {
       model: 'google/gemma-2-2b-it',
       geometry: { num_layers: 26, num_heads: 8, num_kv_heads: 4, head_dim: 256 },
       layers: Array.from({ length: 26 }, (_, i) => i),
+      hidden_size: 2304,
+      sae: { kind: 'gemma-scope', root: '/sae', hf_cache: true },
       circuit: snapshot(),
     })
     expect(useCircuitStore.getState().numLayers).toBe(26)
     expect(useSessionStore.getState().model).toBe('google/gemma-2-2b-it')
+    expect(useSessionStore.getState().sae?.kind).toBe('gemma-scope')
     expect(sent.filter((m) => m.action === 'update')).toHaveLength(1)
   })
 

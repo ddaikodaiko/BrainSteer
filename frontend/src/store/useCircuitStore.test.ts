@@ -40,7 +40,9 @@ describe('debounce de UPDATE_CIRCUIT', () => {
     expect(updates()).toHaveLength(1)
     expect(updates()[0]).toMatchObject({
       action: 'update',
-      layers: expect.arrayContaining([{ layer: 12, alpha: 5, mode: 'orthogonal' }]),
+      layers: expect.arrayContaining([
+        { layer: 21, alpha: 1, mode: 'orthogonal', features: [{ feature_id: 'gemma-2-2b/20-gemmascope-res-16k/12082', alpha: 5 }] },
+      ]),
     })
     expect(store().sync.state).toBe('sent')
   })
@@ -61,15 +63,22 @@ describe('debounce de UPDATE_CIRCUIT', () => {
 
     store().onNodesChange([{ type: 'remove', id: 'layer-a' }])
     vi.advanceTimersByTime(SYNC_DEBOUNCE_MS)
-    expect(updates()).toEqual([{ action: 'update', steering: true, layers: [{ layer: 6, alpha: -1, mode: 'additive' }] }])
+    expect(updates()).toEqual([
+      { action: 'update', steering: true, layers: [{ layer: 6, alpha: 1, mode: 'additive', features: [{ feature_id: null, alpha: -1 }] }] },
+    ])
   })
 
   it('el toggle de modo y el cambio de capa pasan por el mismo debounce', () => {
     store().updateNodeData('layer-a', { mode: 'additive' })
-    store().updateNodeData('layer-a', { layer: 13 })
+    store().updateNodeData('layer-a', { layer: 22 })
     vi.advanceTimersByTime(SYNC_DEBOUNCE_MS)
     expect(updates()).toHaveLength(1)
-    expect((updates()[0] as { layers: unknown[] }).layers).toContainEqual({ layer: 13, alpha: 2.5, mode: 'additive' })
+    expect((updates()[0] as { layers: unknown[] }).layers).toContainEqual({
+      layer: 22,
+      alpha: 1,
+      mode: 'additive',
+      features: [{ feature_id: 'gemma-2-2b/20-gemmascope-res-16k/12082', alpha: 2.5 }],
+    })
   })
 
   it('flushSync envía de inmediato y cancela el debounce pendiente', () => {

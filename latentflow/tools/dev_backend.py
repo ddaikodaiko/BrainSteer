@@ -17,6 +17,10 @@ El texto generado es ruido (los pesos son aleatorios). La geometría por defecto
 reproduce el número de capas y de cabezas de query de Gemma-2-2B (26 × 8); el
 resto de dimensiones está reducido para que corra en CPU.
 
+Las features de Gemma Scope se simulan con ``HashFeatureResolver``: cada Feature
+ID se convierte en un vector determinista (sha256), así el canvas, el slider y la
+telemetría funcionan sin pesos de SAE.
+
 Sin calibración externa, el SKOPEngine se calibra con ruido: Σ_ΔK con secuencias
 aleatorias (utility set) y ``r_q`` con pares aleatorios. Con
 ``LATENTFLOW_CALIBRATION`` carga un artefacto de ``latentflow-calibrate --dev``.
@@ -36,6 +40,7 @@ from fastapi import FastAPI
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from latentflow.api.server import InferenceRuntime, ServerSettings, create_app
+from latentflow.core.sae import HashFeatureResolver
 from latentflow.core.steering import SKOPConfig, SKOPEngine
 
 __all__ = [
@@ -168,7 +173,8 @@ def build_dev_runtime(settings: ServerSettings, spec: DevModelSpec = DevModelSpe
             engine.accumulate_utility_batch(batch())  # Σ_ΔK: utility set (ruido)
             engine.accumulate_concept_batch(batch(), batch())  # r_q: pares de concepto (ruido)
         engine.finalize_calibration().fit()
-    return InferenceRuntime(model, tokenizer, engine, settings)
+    # Features simuladas: vector determinista por hash del ID (sin pesos de SAE).
+    return InferenceRuntime(model, tokenizer, engine, settings, HashFeatureResolver())
 
 
 def dev_runtime_factory(spec: DevModelSpec = DevModelSpec()) -> Callable[[ServerSettings], InferenceRuntime]:
