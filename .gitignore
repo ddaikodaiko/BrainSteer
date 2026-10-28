@@ -61,3 +61,7 @@ src-tauri/target/
 .DS_Store
 Thumbs.db
 *.log
+
+# Vídeo: renders y pista generada (se regeneran)
+media/launch-video/out/
+media/launch-video/public/music.wav
