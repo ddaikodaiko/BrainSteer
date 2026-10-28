@@ -23,7 +23,7 @@ Orden de búsqueda de ``GemmaScopeResolver`` (``root`` = ``LATENTFLOW_SAE_DIR``)
 
 Para poblarla en una máquina con red::
 
-    huggingface-cli download google/gemma-scope-2b-pt-res-canonical \\
+    hf download google/gemma-scope-2b-pt-res-canonical \\
         --include "layer_20/width_16k/canonical/*"
 
 ``HashFeatureResolver`` (dev backend) genera un vector pseudoaleatorio determinista
@@ -215,7 +215,7 @@ class GemmaScopeResolver:
             except ImportError:
                 pass
         searched = [str(p) for p in candidates] + ([f"caché HF {hf_target}"] if hf_target else [])
-        hint = f" Descarga: huggingface-cli download {hf_target.split(':')[0]} --include \"{hf_target.split(':')[1].rsplit('/', 1)[0]}/*\"" if hf_target else ""
+        hint = f" Descarga: hf download {hf_target.split(':')[0]} --include \"{hf_target.split(':')[1].rsplit('/', 1)[0]}/*\"" if hf_target else ""
         where = "; ".join(searched) if searched else "define LATENTFLOW_SAE_DIR"
         raise FeatureNotFoundError(f"{ref.raw}: no hay pesos locales del SAE '{ref.sae_id}' (buscado en: {where}).{hint}")
 

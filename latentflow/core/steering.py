@@ -369,7 +369,8 @@ def focus_tail_second_moment(
     Para cada query, ``Σ_{i∈F, j∈T} (k_i − k_j)(k_i − k_j)ᵀ`` se factoriza de forma
     exacta como ``Kᵀ G K`` con ``G = diag(w) − C − Cᵀ`` (T×T), donde
     ``w_s = Σ_t F[t,s]·|T_t| + T[t,s]·|F_t|`` y ``C = Fᵀ T``. Así el coste es
-    O(T³ + T²·d) por cabeza en vez de enumerar pares (O(T³·d²)). Las keys con
+    O(T³ + T²·d + T·d²) por cabeza (``C``, ``G K`` y ``Kᵀ (G K)``) en vez de
+    O(P·d²) al enumerar los P pares (hasta O(T³·d²)). Las keys con
     probabilidad 0 (futuras, padding o fuera de la ventana deslizante) no son
     atendibles y no entran en ningún conjunto.
     """

@@ -97,7 +97,7 @@ def test_local_hugging_face_cache_without_network(tmp_path):
 
 def test_resolution_errors(tmp_path):
     resolver = GemmaScopeResolver(str(tmp_path), hf_cache_dir=str(tmp_path / "hf"))
-    with pytest.raises(FeatureNotFoundError, match="huggingface-cli download google/gemma-scope-2b-pt-res-canonical"):
+    with pytest.raises(FeatureNotFoundError, match="hf download google/gemma-scope-2b-pt-res-canonical"):
         resolver.resolve(FID, D_MODEL)
     with pytest.raises(FeatureError, match="atención"):
         resolver.resolve("gemma-2-2b/20-gemmascope-att-16k/7", D_MODEL)

@@ -614,7 +614,7 @@ def test_gemma_scope_weights_are_read_from_local_disk(client, tmp_path):
         version = ws.receive_json()["circuit"]["version"]
         ws.send_json({"action": "update", "steering": True, "layers": feature_layers()})
         err = ws.receive_json()
-        assert err["code"] == "feature_not_found" and "huggingface-cli download" in err["message"]
+        assert err["code"] == "feature_not_found" and "hf download" in err["message"]
         ws.send_json({"action": "update", "layers": feature_layers(fid="gemma-2-2b/0-gemmascope-att-16k/1")})
         assert ws.receive_json()["code"] == "feature_invalid"
         assert runtime.circuit.version == version  # nada aplicado
