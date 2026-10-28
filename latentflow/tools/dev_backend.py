@@ -40,6 +40,7 @@ import torch
 from fastapi import FastAPI
 from transformers import LlamaConfig, LlamaForCausalLM
 
+from latentflow._console import ensure_utf8_stdio
 from latentflow.api.server import InferenceRuntime, ServerSettings, SettingsError, create_app
 from latentflow.core.sae import HashFeatureResolver
 from latentflow.core.steering import SKOPConfig, SKOPEngine
@@ -213,6 +214,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import uvicorn
 
+    ensure_utf8_stdio()
     args = _parse_args(argv)
     try:
         settings = ServerSettings.from_env()

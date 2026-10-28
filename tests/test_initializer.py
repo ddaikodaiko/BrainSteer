@@ -2,6 +2,7 @@
 artefacto -> carga en frío del servidor con ``LATENTFLOW_CALIBRATION``."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -149,11 +150,31 @@ def test_cli_rejects_layers_beyond_the_model(datasets, tmp_path, capsys):
     assert not output.exists()
 
 
-def test_cli_runs_as_module_entrypoint():
+@pytest.mark.parametrize("stdio_encoding", ["utf-8", "cp1252"])
+def test_cli_runs_as_module_entrypoint(stdio_encoding):
+    """cp1252 es lo que usa Python en Windows con la salida redirigida: el `--help`
+    (Σ_ΔK, τ...) fallaba con UnicodeEncodeError. Los CLIs escriben siempre UTF-8."""
     result = subprocess.run(
-        [sys.executable, "-m", "latentflow.tools.initializer", "--help"], cwd=ROOT, capture_output=True, text=True, timeout=120
+        [sys.executable, "-m", "latentflow.tools.initializer", "--help"], cwd=ROOT, capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": stdio_encoding}, encoding="utf-8", timeout=120,
     )
-    assert result.returncode == 0 and "latentflow-calibrate" in result.stdout
+    assert result.returncode == 0, result.stderr
+    assert "latentflow-calibrate" in result.stdout and "Σ_ΔK" in result.stdout
+
+
+def test_ensure_utf8_stdio_reconfigures_legacy_code_pages(monkeypatch):
+    import io
+
+    from latentflow._console import ensure_utf8_stdio
+
+    raw = io.BytesIO()
+    legacy = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", legacy)
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="utf-8"))
+    ensure_utf8_stdio()
+    print("Σ_ΔK · τ_R")
+    legacy.flush()
+    assert legacy.encoding == "utf-8" and raw.getvalue().decode("utf-8") == "Σ_ΔK · τ_R\n"
 
 
 # --------------------------------------------------------------------------- #

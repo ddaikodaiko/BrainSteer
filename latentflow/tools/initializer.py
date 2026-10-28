@@ -44,6 +44,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
+from latentflow._console import ensure_utf8_stdio
 from latentflow.core.steering import ARTIFACT_FORMAT, DEFAULT_MODEL_ID, SKOPConfig, SKOPEngine
 
 __all__ = [
@@ -332,6 +333,7 @@ def run(args: argparse.Namespace, log=print) -> Path:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    ensure_utf8_stdio()
     args = build_parser().parse_args(argv)
     try:
         run(args)

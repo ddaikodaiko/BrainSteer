@@ -90,6 +90,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from transformers import StoppingCriteria, StoppingCriteriaList
 from transformers.generation.streamers import BaseStreamer
 
+from latentflow._console import ensure_utf8_stdio
 from latentflow.core.sae import FeatureError, FeatureNotFoundError, FeatureResolver, GemmaScopeResolver, ResolvedFeature
 from latentflow.core.steering import DEFAULT_MODEL_ID, SKOPConfig, SKOPEngine, load_quantized_model
 
@@ -1080,6 +1081,7 @@ def main() -> int:
     """CLI ``latentflow-server``: valida la configuración antes de cargar nada."""
     import uvicorn
 
+    ensure_utf8_stdio()
     try:
         settings = ServerSettings.from_env()
         port = _env_number("LATENTFLOW_PORT", 8000, int, minimum=1)
