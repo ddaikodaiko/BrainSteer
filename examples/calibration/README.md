@@ -7,6 +7,8 @@ Ficheros mínimos que **documentan el formato**; no son datasets de calibración
   `{"question", "answer"}` o cadenas sueltas.
 - `concept.example.jsonl` — pares `{"positive", "negative"}` para la dirección
   `r_q` (aquí, registro formal frente a informal).
+- `formal_informal.jsonl` — 60 pares formal ↔ informal en inglés con el mismo
+  contenido: un concept set listo para una primera calibración real.
 
 Para una calibración real, usa unos cientos de muestras de utilidad (por ejemplo
 Alpaca + GSM8K exportados con `datasets`, ver `latentflow/tools/initializer.py`) y

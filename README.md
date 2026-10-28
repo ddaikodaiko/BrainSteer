@@ -189,7 +189,9 @@ EOF
 ```
 
 Para el concept set, entre 50 y 200 pares que aíslen el comportamiento a dirigir
-(formato en [`examples/calibration/`](examples/calibration/README.md)). Si sólo vas
+(formato en [`examples/calibration/`](examples/calibration/README.md)). Para una
+primera prueba sirve `examples/calibration/formal_informal.jsonl` (60 pares de
+registro formal ↔ informal). Si sólo vas
 a usar features de Gemma Scope, el concept set sigue siendo necesario: aporta el
 `r_q` de respaldo de las capas sin features.
 
