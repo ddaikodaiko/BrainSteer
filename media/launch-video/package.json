@@ -5,7 +5,8 @@
   "scripts": {
     "studio": "remotion studio",
     "render": "remotion render BrainSteerLaunch out/brainsteer-launch.mp4",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "render:theory": "remotion render BrainSteerTheory out/brainsteer-teoria.mp4"
   },
   "dependencies": {
     "@fontsource/inter": "^5.1.0",

@@ -14,7 +14,7 @@ const handle = delayRender('fuentes');
 const faces = [
   '400 40px Inter', '600 40px Inter', '700 40px Inter', '800 40px Inter',
   '400 30px "JetBrains Mono"', '600 30px "JetBrains Mono"',
-  '40px KaTeX_Main', 'italic 40px KaTeX_Math', '40px KaTeX_AMS', '40px KaTeX_Size1', '40px KaTeX_Size2',
+  '40px KaTeX_Main', 'italic 40px KaTeX_Math', '40px KaTeX_AMS', '40px KaTeX_Caligraphic', '40px KaTeX_Size1', '40px KaTeX_Size2',
 ];
 Promise.all(faces.map((f) => document.fonts.load(f)))
   .then(() => document.fonts.ready)
