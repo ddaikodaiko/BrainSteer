@@ -14,10 +14,11 @@ más arriesgado. Todo se pilota desde un canvas de nodos con chat en streaming y
 osciloscopio de riesgo en tiempo real.
 
 > **Estado del proyecto.** El motor, el servidor y la cabina están cubiertos por
-> el CI (pytest + Vitest + build) y se han probado de extremo a extremo contra el
-> backend de desarrollo (modelo tiny de pesos aleatorios) en Chromium. **Falta la
-> validación con pesos reales** de Gemma-2 y de los SAEs de Gemma Scope en GPU: la
-> [Guía del piloto local](#guía-del-piloto-local) describe exactamente ese paso.
+> el CI (pytest + Vitest + build). Ya funcionan con pesos reales en una RTX 3060 Ti
+> (8 GB, Windows): calibración de Gemma-2-2B-IT en 4 bit, servidor, cabina con una
+> feature de Gemma Scope y comparaciones cualitativas con `latentflow-probe`. **La
+> evaluación cuantitativa** (`latentflow-eval`, vanilla frente a SKOP) **está en
+> marcha**: hasta tener sus números, este README no afirma ningún resultado.
 
 ## Índice
 
